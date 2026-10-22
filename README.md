@@ -67,8 +67,8 @@ about two milliseconds.
 ## Run it
 
 ```sh
-git clone https://github.com/yaminerl/lact-tui
-cd lact-tui
+git clone https://github.com/yaminerl/gpu-control-panel
+cd gpu-control-panel
 ./run.sh
 ```
 
