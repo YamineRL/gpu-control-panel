@@ -31,15 +31,15 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import lact_tui.app as app_module  # noqa: E402
-import lact_tui.fancurve as fancurve  # noqa: E402
-from lact_tui.app import LactApp  # noqa: E402
-from lact_tui.fancurve import CurveConfig  # noqa: E402
-from lact_tui.gpu_processes import GpuProcess  # noqa: E402
-from lact_tui.hwmon import GpuLimits, Sample  # noqa: E402
-from lact_tui.inference import InferenceBar  # noqa: E402
-from lact_tui.llama import InferenceSnapshot  # noqa: E402
-from lact_tui.widgets import ProcessPanel  # noqa: E402
+import gpuctl.app as app_module  # noqa: E402
+import gpuctl.fancurve as fancurve  # noqa: E402
+from gpuctl.app import GpuCtlApp  # noqa: E402
+from gpuctl.fancurve import CurveConfig  # noqa: E402
+from gpuctl.gpu_processes import GpuProcess  # noqa: E402
+from gpuctl.hwmon import GpuLimits, Sample  # noqa: E402
+from gpuctl.inference import InferenceBar  # noqa: E402
+from gpuctl.llama import InferenceSnapshot  # noqa: E402
+from gpuctl.widgets import ProcessPanel  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 
 ASSETS = ROOT / "assets"
@@ -244,7 +244,7 @@ def _processes() -> list[GpuProcess]:
     ]
 
 
-def _prepare(app: LactApp) -> None:
+def _prepare(app: GpuCtlApp) -> None:
     """Freeze timers and stop the app from touching the user's state files."""
     for timer in (app._poll_timer, app._inference_timer):
         if timer is not None:
@@ -258,13 +258,13 @@ def _freeze_state_files() -> None:
     selected curve profile between runs; a documentation render must not
     overwrite any of them.
     """
-    LactApp._load_last_timeframe = staticmethod(lambda: 300)  # type: ignore[method-assign]
-    LactApp._load_probe_interval = staticmethod(lambda: 2000)  # type: ignore[method-assign]
-    LactApp._save_last_timeframe = staticmethod(lambda seconds: None)  # type: ignore[method-assign]
-    LactApp._save_probe_interval = staticmethod(lambda ms: None)  # type: ignore[method-assign]
+    GpuCtlApp._load_last_timeframe = staticmethod(lambda: 300)  # type: ignore[method-assign]
+    GpuCtlApp._load_probe_interval = staticmethod(lambda: 2000)  # type: ignore[method-assign]
+    GpuCtlApp._save_last_timeframe = staticmethod(lambda seconds: None)  # type: ignore[method-assign]
+    GpuCtlApp._save_probe_interval = staticmethod(lambda ms: None)  # type: ignore[method-assign]
 
 
-def _new_app() -> LactApp:
+def _new_app() -> GpuCtlApp:
     _freeze_state_files()
     app_module.load_config = lambda: (
         CurveConfig(autostart=False, active="balanced"),
@@ -273,14 +273,14 @@ def _new_app() -> LactApp:
     # A render must never rewrite the local curve config: pin the real ones.
     app_module.save_config = lambda config: None  # type: ignore[assignment]
     fancurve.save_config = app_module.save_config  # type: ignore[assignment]
-    app = LactApp(DemoHwmon())  # type: ignore[arg-type]
+    app = GpuCtlApp(DemoHwmon())  # type: ignore[arg-type]
     app._poll_once = lambda: None  # type: ignore[method-assign]
     app._schedule_inference = lambda: None  # type: ignore[method-assign]
     app._scan_processes = lambda: None  # type: ignore[method-assign]
     return app
 
 
-def _fill(app: LactApp) -> None:
+def _fill(app: GpuCtlApp) -> None:
     """Put the synthetic history, readings and inference snapshots on screen."""
     now = time.monotonic()
     app.samples.clear()
@@ -342,7 +342,7 @@ async def _render_tiles() -> None:
 def _save(name: str, app: App) -> None:
     ASSETS.mkdir(exist_ok=True)
     svg_path = ASSETS / f"{name}.svg"
-    svg_path.write_text(app.export_screenshot(title="lact-tui"))
+    svg_path.write_text(app.export_screenshot(title="gpuctl"))
     png_path = ASSETS / f"{name}.png"
     subprocess.run(
         ["rsvg-convert", "-o", str(png_path), str(svg_path)],

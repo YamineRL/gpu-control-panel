@@ -1,6 +1,6 @@
 """Live decode / prefill throughput from a local llama.cpp server.
 
-LACT-TUI is a fan-control TUI, but the machine it runs on often has a
+GPU Control Panel is a fan-control TUI, but the machine it runs on often has a
 llama.cpp server (`llama-server`, optionally behind `llama-swap`) using
 the same GPU. This module turns that server's `/slots` endpoint into two
 numbers people actually stare at while a model runs:
@@ -13,7 +13,7 @@ request's rates are kept so an idle server still shows what it last did.
 
 Discovery is best effort and needs no configuration:
 
-1. ``LACT_TUI_LLAMA_URL`` (+ ``LACT_TUI_LLAMA_KEY`` / ``..._KEY_FILE``) wins.
+1. ``GPU_CTL_LLAMA_URL`` (+ ``GPU_CTL_LLAMA_KEY`` / ``..._KEY_FILE``) wins.
 2. Any ``llama-server`` process owned by the current user: its ``--port``,
    ``--api-key-file`` and ``-m`` are read straight from ``/proc/<pid>/cmdline``.
    That also works when the server was started by hand or by llama-swap.
@@ -171,13 +171,13 @@ def _target_from_argv(argv: list[str], origin: str, model: str = "") -> LlamaTar
 
 
 def _candidate_from_env() -> list[LlamaTarget]:
-    url = os.environ.get("LACT_TUI_LLAMA_URL", "").strip()
+    url = os.environ.get("GPU_CTL_LLAMA_URL", "").strip()
     if not url:
         return []
     if "://" not in url:
         url = f"http://{url}"
-    key = os.environ.get("LACT_TUI_LLAMA_KEY") or None
-    key_file = os.environ.get("LACT_TUI_LLAMA_KEY_FILE")
+    key = os.environ.get("GPU_CTL_LLAMA_KEY") or None
+    key_file = os.environ.get("GPU_CTL_LLAMA_KEY_FILE")
     if key is None and key_file:
         key = _read_key_file(key_file)
     return [LlamaTarget(base_url=url.rstrip("/"), api_key=key, origin="env")]

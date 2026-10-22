@@ -37,7 +37,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-CONFIG_FILE = Path(__file__).resolve().parent.parent / ".lact_tui_fancurve.json"
+CONFIG_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_fancurve.json"
 
 PROFILE_ORDER = ("quiet", "balanced", "cool")
 

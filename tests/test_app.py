@@ -12,10 +12,10 @@ from __future__ import annotations
 import asyncio
 import time
 
-from lact_tui.app import LactApp
-from lact_tui.graphs import Series, render_chart, render_sparkline
-from lact_tui.hwmon import HwmonNotFoundError, HwmonSource
-from lact_tui.llama import InferenceSnapshot
+from gpuctl.app import GpuCtlApp
+from gpuctl.graphs import Series, render_chart, render_sparkline
+from gpuctl.hwmon import HwmonNotFoundError, HwmonSource
+from gpuctl.llama import InferenceSnapshot
 
 
 def test_graph_render_is_fast() -> None:
@@ -67,7 +67,7 @@ def test_inference_rates() -> None:
     batch of 1,024 tokens seen after 2.5 s has to read as ~410 tok/s, not
     2,048.
     """
-    from lact_tui import llama
+    from gpuctl import llama
 
     clock = {"t": 100.0}
     payloads: list[list[dict]] = []
@@ -138,9 +138,9 @@ async def _app_checks() -> None:
 
     # The local config autostarts the fan curve, which opens the sudo modal
     # over everything. Tests want the plain screen.
-    import lact_tui.app as app_module
-    from lact_tui.app import PROBE_STATE_FILE, STATE_FILE
-    from lact_tui.fancurve import CurveConfig
+    import gpuctl.app as app_module
+    from gpuctl.app import PROBE_STATE_FILE, STATE_FILE
+    from gpuctl.fancurve import CurveConfig
 
     original = app_module.load_config
     app_module.load_config = lambda: (CurveConfig(autostart=False), None)
@@ -151,7 +151,7 @@ async def _app_checks() -> None:
         for path in (STATE_FILE, PROBE_STATE_FILE)
     }
     try:
-        app = LactApp(hwmon)
+        app = GpuCtlApp(hwmon)
     finally:
         app_module.load_config = original
     try:
@@ -167,7 +167,7 @@ async def _app_checks() -> None:
                 pass
 
 
-async def _drive_app(app: LactApp, hwmon: HwmonSource) -> None:
+async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
         # Feed a few samples so the graph has data.

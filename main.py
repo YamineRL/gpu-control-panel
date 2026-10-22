@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point for LACT-TUI.
+"""Entry point for GPU Control Panel.
 
 See README.md, or just run ./run.sh from this directory.
 
@@ -10,7 +10,7 @@ Usage:
 """
 import sys
 
-from lact_tui.app import main
+from gpuctl.app import main
 
 if __name__ == "__main__":
     main(debug="--debug" in sys.argv)

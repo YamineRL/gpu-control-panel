@@ -1,4 +1,4 @@
-"""LACT-TUI main application.
+"""GPU Control Panel main application.
 
 A Textual TUI for monitoring and controlling the fan of an AMD GPU via the
 amdgpu driver's hwmon sysfs interface (pwm1 / pwm1_enable / fan1_input /
@@ -62,8 +62,8 @@ PWM_DRIFT_TOLERANCE = 3
 # full "1h" window's worth of history no matter what rate is picked later.
 MAX_SAMPLES = int(TIMEFRAMES[-1][1] / (PROBE_INTERVAL_MIN_MS / 1000)) + 10
 
-STATE_FILE = Path(__file__).resolve().parent.parent / ".lact_tui_state"
-PROBE_STATE_FILE = Path(__file__).resolve().parent.parent / ".lact_tui_probe_interval"
+STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_state"
+PROBE_STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_probe_interval"
 
 TEMP_COLORS = {"edge": "cyan", "junction": "#ff8700", "mem": "magenta"}
 # Dimmer variants used for the filled area under each line (btop style: a
@@ -175,10 +175,10 @@ class GpuProcessesScanned(Message):
         self.processes = processes
 
 
-class LactApp(App):
-    """The main LACT-TUI application."""
+class GpuCtlApp(App):
+    """The main GPU Control Panel application."""
 
-    TITLE = "LACT-TUI"
+    TITLE = "GPU Control Panel"
     SUB_TITLE = "AMD GPU fan control"
     CSS_PATH = "styles.tcss"
     # Textual's built-in command palette (ctrl+p) is unrelated to fan control
@@ -762,7 +762,7 @@ class LactApp(App):
                 sample = None
             if sample is not None and sample.pwm_enable != 1:
                 await self._stop_curve(
-                    "Fan mode was changed outside LACT-TUI. Fan curve stopped.", "warning"
+                    "Fan mode was changed outside GPU Control Panel. Fan curve stopped.", "warning"
                 )
                 return
 
@@ -797,7 +797,7 @@ def main(debug: bool = False) -> None:
         HwmonMissingApp(str(exc)).run()
         return
 
-    LactApp(hwmon, debug=debug).run()
+    GpuCtlApp(hwmon, debug=debug).run()
 
 
 if __name__ == "__main__":

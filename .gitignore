@@ -7,9 +7,9 @@ venv/
 .pytest_cache/
 
 # Local state the app writes next to the checkout
-.lact_tui_state
-.lact_tui_probe_interval
-.lact_tui_fancurve.json
+.gpuctl_state
+.gpuctl_probe_interval
+.gpuctl_fancurve.json
 
 # SVG sources produced next to the README screenshots
 assets/*.svg

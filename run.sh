@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets up the local venv (first run only) and launches LACT-TUI.
+# Sets up the local venv (first run only) and launches GPU Control Panel.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 

@@ -67,7 +67,7 @@ def _make_askpass_script(password: str) -> str:
     nonzero (which sudo treats as "no password available", giving up
     immediately) on any retry, so one typo costs at most one strike.
     """
-    fd, path = tempfile.mkstemp(prefix="lact-tui-askpass-", dir=_runtime_dir())
+    fd, path = tempfile.mkstemp(prefix="gpuctl-askpass-", dir=_runtime_dir())
     marker = f"{path}.used"
     try:
         script = (
@@ -203,7 +203,7 @@ class RootFanHelper:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "sudo", "-A", "-k", "sh", "-c", _FAN_HELPER_SCRIPT,
-                "lact-tui-fan", enable_path, pwm_path,
+                "gpuctl-fan", enable_path, pwm_path,
                 env={**os.environ, "SUDO_ASKPASS": askpass},
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

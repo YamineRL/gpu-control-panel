@@ -222,6 +222,6 @@ class HwmonMissingApp(App):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
-            yield Static("LACT-TUI: no amdgpu GPU found", id="title")
+            yield Static("GPU Control Panel: no amdgpu GPU found", id="title")
             yield Static(self._message)
             yield Static("\nPress q to quit.")

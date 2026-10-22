@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/tiles.png" width="920" alt="LACT-TUI inference tiles: decode and prefill tokens per second, context use, model state">
+<img src="assets/tiles.png" width="920" alt="GPU Control Panel inference tiles: decode and prefill tokens per second, context use, model state">
 
-# LACT-TUI
+# GPU Control Panel
 
 **AMD GPU fan control in the terminal, with live llama.cpp inference telemetry.**
 
@@ -13,13 +13,13 @@
 
 </div>
 
-LACT-TUI talks to the `amdgpu` hwmon interface in `/sys/class/drm/` directly:
-no `lactd`, no root daemon, no plotting library. One Textual app draws a
-btop-style temperature graph, a strip of inference tiles for the llama.cpp
-model currently loaded on the card, and an nvtop-style process table, and it
-drives the fan itself when you want a real curve.
+GPU Control Panel talks to the `amdgpu` hwmon interface in `/sys/class/drm/`
+directly: no daemon, no root service, no plotting library. One Textual app
+draws a btop-style temperature graph, a strip of inference tiles for the
+llama.cpp model currently loaded on the card, and an nvtop-style process
+table, and it drives the fan itself when you want a real curve.
 
-<img src="assets/overview.png" width="920" alt="LACT-TUI main screen: inference tiles, temperature graph, fan and power panels">
+<img src="assets/overview.png" width="920" alt="GPU Control Panel main screen: inference tiles, temperature graph, fan and power panels">
 
 ## What it does
 
@@ -121,7 +121,7 @@ arrived after 2.5 s.
 
 Nothing needs configuring. The server is found in this order:
 
-1. `LACT_TUI_LLAMA_URL` (with `LACT_TUI_LLAMA_KEY` or `LACT_TUI_LLAMA_KEY_FILE`)
+1. `GPU_CTL_LLAMA_URL` (with `GPU_CTL_LLAMA_KEY` or `GPU_CTL_LLAMA_KEY_FILE`)
 2. a `llama-server` process owned by you: `--host` / `--port`,
    `--api-key-file` and `-m` are read from `/proc/<pid>/cmdline`, which also
    works when llama-swap or a script started it
@@ -163,14 +163,14 @@ Two small state files live next to the checkout and are gitignored:
 
 | File | Contents |
 |------|----------|
-| `.lact_tui_state` | last graph timeframe, in seconds |
-| `.lact_tui_probe_interval` | hwmon poll interval in ms (500-5000) |
-| `.lact_tui_fancurve.json` | fan curve profiles (written with the defaults on first run) |
+| `.gpuctl_state` | last graph timeframe, in seconds |
+| `.gpuctl_probe_interval` | hwmon poll interval in ms (500-5000) |
+| `.gpuctl_fancurve.json` | fan curve profiles (written with the defaults on first run) |
 
 To start from a clean, fully commented example instead of the defaults:
 
 ```sh
-cp examples/fancurve.example.json .lact_tui_fancurve.json
+cp examples/fancurve.example.json .gpuctl_fancurve.json
 ```
 
 Edit it and press `r` to reload. A bad file is reported and ignored, and the
@@ -230,7 +230,7 @@ contain anything from the machine that renders them:
 ```
 main.py                 entry point
 run.sh                  venv setup + launch wrapper
-lact_tui/
+gpuctl/
   hwmon.py              hwmon discovery + sysfs reads (no writes)
   fancurve.py           curve profiles, config file, curve controller
   privileged.py         sudo-authenticated writes + the root fan helper
@@ -251,9 +251,8 @@ examples/
 ## Scope
 
 Fan control and monitoring only: no overclocking, power-limit editing or
-power-profile switching. The name is a nod to [LACT](https://github.com/ilya-zlobintsev/LACT);
-this is an independent tool and does not use its daemon. Built and used on
-RDNA2 (Navi 21), where the kernel offers no fan curve of its own.
+power-profile switching. Built and used on RDNA2 (Navi 21), where the kernel
+offers no fan curve of its own.
 
 ## License
 
