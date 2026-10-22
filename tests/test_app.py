@@ -193,7 +193,7 @@ async def _drive_app(app: LactApp, hwmon: HwmonSource) -> None:
         app._apply_inference(
             InferenceSnapshot(
                 ok=True,
-                model="Qwen3-32B-Q4_K_M",
+                model="Qwen4-27B-Q4_K_M",
                 state="generate",
                 gen_tps=41.2,
                 last_prefill_tps=1183.0,

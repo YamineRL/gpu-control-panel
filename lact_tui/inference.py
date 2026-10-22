@@ -36,7 +36,7 @@ STATE_STYLES = {
 
 
 def _short_model(name: str) -> str:
-    """Qwen3-32B-Q4_K_M.gguf -> Qwen3-32B-Q4_K_M (any directory, clipped)."""
+    """Qwen4-27B-Q4_K_M.gguf -> Qwen4-27B-Q4_K_M (any directory, clipped)."""
     if not name:
         return "no model"
     base = name.rsplit("/", 1)[-1]

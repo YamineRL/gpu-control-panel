@@ -50,7 +50,7 @@ KEEP_SVG = False
 
 # Everything below is invented; keep it generic so the screenshots stay
 # portable and leak nothing about the machine that produced them.
-MODEL = "Qwen3-32B-Q4_K_M"
+MODEL = "Qwen4-27B-Q4_K_M"
 ORIGIN = "llama-server"
 CTX_TOTAL = 98_304
 GIB = 1024**3
