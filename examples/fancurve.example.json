@@ -1,0 +1,82 @@
+{
+  "active": "balanced",
+  "autostart": false,
+  "emergency_margin_c": 10,
+  "profiles": {
+    "quiet": {
+      "curves": {
+        "junction": [
+          [55, 0],
+          [60, 22],
+          [70, 30],
+          [80, 45],
+          [90, 68],
+          [100, 100]
+        ],
+        "mem": [
+          [75, 0],
+          [80, 25],
+          [88, 50],
+          [94, 100]
+        ]
+      },
+      "min_spin_pct": 20,
+      "hysteresis_c": 5,
+      "spin_down_delay_s": 15,
+      "ramp_down_pct_per_s": 1.5,
+      "ramp_up_pct_per_s": 15,
+      "smoothing_s": 6,
+      "lookahead_s": 0
+    },
+    "balanced": {
+      "curves": {
+        "junction": [
+          [48, 0],
+          [50, 25],
+          [65, 38],
+          [80, 60],
+          [90, 82],
+          [98, 100]
+        ],
+        "mem": [
+          [70, 0],
+          [72, 28],
+          [85, 55],
+          [92, 100]
+        ]
+      },
+      "min_spin_pct": 22,
+      "hysteresis_c": 4,
+      "spin_down_delay_s": 8,
+      "ramp_down_pct_per_s": 3,
+      "ramp_up_pct_per_s": 25,
+      "smoothing_s": 4,
+      "lookahead_s": 3
+    },
+    "cool": {
+      "curves": {
+        "junction": [
+          [0, 30],
+          [50, 35],
+          [65, 50],
+          [75, 70],
+          [85, 90],
+          [92, 100]
+        ],
+        "mem": [
+          [0, 30],
+          [70, 40],
+          [82, 70],
+          [90, 100]
+        ]
+      },
+      "min_spin_pct": 25,
+      "hysteresis_c": 3,
+      "spin_down_delay_s": 5,
+      "ramp_down_pct_per_s": 4,
+      "ramp_up_pct_per_s": 50,
+      "smoothing_s": 2,
+      "lookahead_s": 6
+    }
+  }
+}

@@ -1,0 +1,68 @@
+Screen {
+    background: $background;
+}
+
+#body {
+    height: 1fr;
+}
+
+#graph-panel {
+    width: 3fr;
+    padding: 0 1;
+    height: 1fr;
+}
+
+#graph-toolbar {
+    height: 3;
+    width: 100%;
+}
+
+#graph-toolbar TimeframeBar {
+    width: 1fr;
+}
+
+#graph-toolbar ProbeRateBar {
+    width: auto;
+}
+
+#graph {
+    height: 1fr;
+    border: round $primary;
+    padding: 0 1;
+}
+
+#sidebar {
+    width: 34;
+    min-width: 30;
+    padding: 0 1 0 0;
+}
+
+#process-panel {
+    height: 14;
+    margin: 0 1 1 1;
+}
+
+#control-bar {
+    height: auto;
+    border: round $primary-lighten-1;
+    padding: 0 1;
+    margin: 0 1 1 1;
+}
+
+#control-hint {
+    color: $text-muted;
+    height: 1;
+}
+
+ProgressBar {
+    width: 100%;
+    margin-top: 1;
+}
+
+ProgressBar > .bar--bar {
+    color: $success;
+}
+
+ProgressBar > .bar--complete {
+    color: $warning;
+}

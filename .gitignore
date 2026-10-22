@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Local state the app writes next to the checkout
+.lact_tui_state
+.lact_tui_probe_interval
+.lact_tui_fancurve.json
+
+# SVG sources produced next to the README screenshots
+assets/*.svg
+
+# Local tooling (code graph, agent worktrees); nothing here is needed to run
+.graft/
+graft/
+.claude/
+.fusion/
+.ignore
