@@ -41,6 +41,29 @@ _LABEL = "grey58"
 ColorLike = str | Style | tuple[int, int, int]
 
 
+def snap_window(now: float, window: float, columns: int) -> tuple[float, float]:
+    """A right-edge-anchored window whose columns fall on fixed clock times.
+
+    ``render_chart`` draws one value per braille dot column, i.e. two per
+    text column, and a column's value is interpolated at its centre. If the
+    window slides continuously with the clock (``now - window, now``), every
+    column's centre moves by a fraction of a column on every refresh, so the
+    interpolation weights for the *whole* history change each frame and the
+    curve visibly boils instead of scrolling.
+
+    Rounding the right edge down to a multiple of one dot column, in absolute
+    time, pins dot ``k`` to the same instant on every refresh: the oldest
+    columns become bit-identical and the graph advances left one dot at a
+    time. The cost is that the right edge lags by up to one dot column.
+    """
+    columns = max(int(columns), 2)
+    if window <= 0.0:
+        return (now - 1.0, now)
+    step = window / columns
+    right = step * math.floor(now / step)
+    return (right - window, right)
+
+
 @dataclass(frozen=True)
 class Series:
     """One curve plus the colours for its top edge and its filled body."""
@@ -333,11 +356,20 @@ def render_sparkline(
     line: ColorLike,
     fill: ColorLike,
     y_floor: float = 1.0,
+    y_max: float | None = None,
 ) -> Text:
-    """Tiny axes-free chart for a tile; scales to the data's own maximum."""
+    """Tiny axes-free chart for a tile; scales to the data's own maximum.
+
+    ``y_max`` fixes the scale instead of deriving it from the current data,
+    which keeps old points from being rescaled (and the line from jumping
+    vertically) on every update.
+    """
     values = [y for _, y in points if math.isfinite(y)]
-    top = max(values) if values else 0.0
-    top = max(top, y_floor) * 1.15
+    if y_max is not None and math.isfinite(y_max):
+        top = y_max
+    else:
+        top = max(values) if values else 0.0
+        top = max(top, y_floor) * 1.15
     return render_chart(
         [Series(points, line, fill)],
         width,
@@ -430,6 +462,7 @@ class Sparkline(Widget):
         line: ColorLike = "cyan",
         fill: ColorLike = (0, 70, 70),
         span: float = 120.0,
+        y_max: float | None = None,
         name: str | None = None,
         id: str | None = None,
         classes: str | None = None,
@@ -438,6 +471,7 @@ class Sparkline(Widget):
         self._line = line
         self._fill = fill
         self._span = span
+        self._y_max = y_max
         self._points: list[tuple[float, float]] = []
         self._now = 0.0
 
@@ -456,12 +490,16 @@ class Sparkline(Widget):
             return Text("")
         if not self._points:
             return Text("")
+        # Same snapping as the big graph (two dot columns per cell), so the
+        # sparkline scrolls instead of being resampled into a boil.
+        x_range = snap_window(self._now, self._span, width * 2)
         return render_sparkline(
             self._points,
             width,
             height,
-            x_range=(self._now - self._span, self._now),
+            x_range=x_range,
             line=self._line,
             fill=self._fill,
             y_floor=1.0,
+            y_max=self._y_max,
         )

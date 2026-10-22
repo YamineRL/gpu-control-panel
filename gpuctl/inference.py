@@ -27,6 +27,11 @@ PREFILL_FILL = (0, 45, 80)
 CONTEXT_LINE = "yellow3"
 CONTEXT_FILL = (60, 50, 0)
 
+# Sparkline ceilings. Decode is tens of tokens/second and prefill is
+# thousands, so they get their own scales; context use is always a percent.
+DECODE_Y_MAX = 120.0
+PREFILL_Y_MAX = 4000.0
+
 STATE_STYLES = {
     "generate": ("spring_green2", "generating"),
     "prefill": ("#5fafff", "prefill"),
@@ -54,7 +59,7 @@ class MetricTile(Vertical):
     MetricTile {
         width: 1fr;
         min-width: 0;
-        height: 6;
+        height: 7;
         border: round $primary;
         padding: 0 1;
         margin: 0 1 0 0;
@@ -65,6 +70,12 @@ class MetricTile(Vertical):
         text-overflow: ellipsis;
     }
     MetricTile .metric-note {
+        height: 1;
+        width: 100%;
+        color: $text-muted;
+        text-overflow: ellipsis;
+    }
+    MetricTile .metric-extremes {
         height: 1;
         width: 100%;
         color: $text-muted;
@@ -84,6 +95,7 @@ class MetricTile(Vertical):
         line: str = "cyan",
         fill: tuple[int, int, int] = (0, 60, 60),
         span: float = 120.0,
+        y_max: float | None = None,
         placeholder: str = "--",
         name: str | None = None,
         id: str | None = None,
@@ -94,20 +106,29 @@ class MetricTile(Vertical):
         self._line = line
         self._fill = fill
         self._span = span
+        # A fixed ceiling keeps the sparkline's scale (and so every old
+        # point in it) stable from one update to the next.
+        self._y_max = y_max
         self._placeholder = placeholder
 
     def compose(self) -> ComposeResult:
         yield Static(self._placeholder, classes="metric-value", markup=False)
         yield Sparkline(
-            line=self._line, fill=self._fill, span=self._span, classes="metric-body"
+            line=self._line,
+            fill=self._fill,
+            span=self._span,
+            y_max=self._y_max,
+            classes="metric-body",
         )
         yield Static("", classes="metric-note", markup=False)
+        yield Static("", classes="metric-extremes", markup=False)
 
     def update_tile(
         self,
         value: Text | str,
-        note: str | None = None,
+        note: Text | str | None = None,
         *,
+        extremes: Text | str | None = None,
         points: list[tuple[float, float]] | None = None,
         now: float | None = None,
         span: float | None = None,
@@ -119,7 +140,13 @@ class MetricTile(Vertical):
             value.stylize(value_style)
         self.query_one(".metric-value", Static).update(value)
         if note is not None:
-            self.query_one(".metric-note", Static).update(Text(note))
+            self.query_one(".metric-note", Static).update(
+                note if isinstance(note, Text) else Text(note)
+            )
+        if extremes is not None:
+            self.query_one(".metric-extremes", Static).update(
+                extremes if isinstance(extremes, Text) else Text(extremes)
+            )
         if points is not None:
             self.query_one(Sparkline).update_points(
                 points, now if now is not None else time.monotonic(), span
@@ -133,7 +160,7 @@ class StateTile(Vertical):
     StateTile {
         width: 1fr;
         min-width: 0;
-        height: 6;
+        height: 7;
         border: round $primary;
         padding: 0 1;
     }
@@ -153,6 +180,10 @@ class StateTile(Vertical):
         color: $text-muted;
         text-overflow: ellipsis;
     }
+    StateTile .state-spare {
+        height: 1;
+        width: 100%;
+    }
     """
 
     def __init__(self, name: str | None = None, id: str | None = None) -> None:
@@ -163,6 +194,7 @@ class StateTile(Vertical):
         yield Static("no model", classes="metric-value", markup=False)
         yield Static("", classes="state-line", markup=False)
         yield Static("", classes="metric-note", markup=False)
+        yield Static("", classes="state-spare", markup=False)
 
     def update_tile(self, snapshot: InferenceSnapshot) -> None:
         color, state_label = STATE_STYLES.get(snapshot.state, ("grey62", snapshot.state))
@@ -198,7 +230,7 @@ class InferenceBar(Horizontal):
 
     DEFAULT_CSS = """
     InferenceBar {
-        height: 6;
+        height: 7;
         width: 100%;
         padding: 0 1;
     }
@@ -210,6 +242,9 @@ class InferenceBar(Horizontal):
         self._prefill: deque[tuple[float, float]] = deque(maxlen=HISTORY)
         self._ctx: deque[tuple[float, float]] = deque(maxlen=HISTORY)
         self._span = 120.0
+        # Session-scoped extremes: they span the whole session (not just the
+        # sparkline window) and are never cleared while the session runs.
+        self._extremes: dict[str, tuple[float, float]] = {}  # key -> (min, max)
 
     def compose(self) -> ComposeResult:
         yield MetricTile(
@@ -217,6 +252,7 @@ class InferenceBar(Horizontal):
             line=DECODE_LINE,
             fill=DECODE_FILL,
             span=self._span,
+            y_max=DECODE_Y_MAX,
             id="tile-decode",
         )
         yield MetricTile(
@@ -224,6 +260,7 @@ class InferenceBar(Horizontal):
             line=PREFILL_LINE,
             fill=PREFILL_FILL,
             span=self._span,
+            y_max=PREFILL_Y_MAX,
             id="tile-prefill",
         )
         yield MetricTile(
@@ -231,12 +268,41 @@ class InferenceBar(Horizontal):
             line=CONTEXT_LINE,
             fill=CONTEXT_FILL,
             span=self._span,
+            y_max=100.0,
             placeholder="0%",
             id="tile-context",
         )
         yield StateTile(id="tile-model")
 
     # -- updates -------------------------------------------------------
+
+    def _extend_extremes(self, key: str, value: float) -> None:
+        low, high = self._extremes.get(key, (value, value))
+        self._extremes[key] = (min(low, value), max(high, value))
+
+    def _extremes_text(self, key: str, *, percent: bool = False) -> Text:
+        """``min 28.4 · max 41.9`` for the session, or dashes when empty.
+
+        The separator deliberately has no leading spaces: a run that starts
+        with a space exports to SVG as a run with zero-width space glyphs, so
+        the gap disappears in screenshots and any non-terminal render.
+        """
+        if key not in self._extremes:
+            text = Text("min ", style="grey58")
+            text.append("--", style="bold grey74")
+            text.append(" · max ", style="grey58")
+            text.append("--", style="bold grey74")
+            return text
+        low, high = self._extremes[key]
+        text = Text("min ", style="grey58")
+        text.append(
+            f"{low:.0f}%" if percent else format_rate(low), style="bold grey74"
+        )
+        text.append(" · max ", style="grey58")
+        text.append(
+            f"{high:.0f}%" if percent else format_rate(high), style="bold grey74"
+        )
+        return text
 
     def _note_for(
         self, snapshot: InferenceSnapshot, live: float | None, last: float | None,
@@ -257,15 +323,21 @@ class InferenceBar(Horizontal):
         context = self.query_one("#tile-context", MetricTile)
         model = self.query_one("#tile-model", StateTile)
 
+        if snapshot.new_session:
+            self._extremes.clear()
+
         if snapshot.gen_tps is not None:
             self._gen.append((now, snapshot.gen_tps))
+            self._extend_extremes("decode", snapshot.gen_tps)
         if snapshot.prefill_tps is not None:
             self._prefill.append((now, snapshot.prefill_tps))
+            self._extend_extremes("prefill", snapshot.prefill_tps)
         pct = 0.0
         if snapshot.ctx_total:
             pct = 100.0 * snapshot.ctx_used / snapshot.ctx_total
         if snapshot.ok:
             self._ctx.append((now, pct))
+            self._extend_extremes("ctx", pct)
 
         # Drop points that scrolled out of the tile's time span so the
         # deque cannot grow without bound on a slow probe.
@@ -275,9 +347,13 @@ class InferenceBar(Horizontal):
                 history.popleft()
 
         if not snapshot.ok:
-            for tile in (decode, prefill, context):
+            for tile, key in ((decode, "decode"), (prefill, "prefill"), (context, "ctx")):
                 tile.update_tile(
-                    Text("--", style="grey42"), "offline", points=[], now=now
+                    Text("--", style="grey42"),
+                    "offline",
+                    extremes=self._extremes_text(key, percent=(key == "ctx")),
+                    points=[],
+                    now=now,
                 )
             model.update_tile(snapshot)
             return
@@ -294,6 +370,7 @@ class InferenceBar(Horizontal):
             ),
             self._note_for(snapshot, snapshot.gen_tps, snapshot.last_gen_tps,
                            "waiting for decode"),
+            extremes=self._extremes_text("decode"),
             points=list(self._gen),
             now=now,
         )
@@ -309,6 +386,7 @@ class InferenceBar(Horizontal):
             ),
             self._note_for(snapshot, snapshot.prefill_tps, snapshot.last_prefill_tps,
                            "waiting for prefill"),
+            extremes=self._extremes_text("prefill"),
             points=list(self._prefill),
             now=now,
         )
@@ -325,6 +403,7 @@ class InferenceBar(Horizontal):
         context.update_tile(
             Text(value, style="bold " + CONTEXT_LINE),
             note,
+            extremes=self._extremes_text("ctx", percent=True),
             points=list(self._ctx),
             now=now,
         )

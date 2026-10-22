@@ -87,6 +87,9 @@ class InferenceSnapshot:
     ctx_used: int = 0
     ctx_total: int = 0
     requests: int = 0
+    # True on the first request of a session, so the tiles can start a fresh
+    # min/max instead of carrying the previous session's numbers.
+    new_session: bool = False
 
 
 # --------------------------------------------------------------- plumbing
@@ -488,11 +491,16 @@ class LlamaMonitor:
         # Prefill -> generate (or idle -> busy) changes which counter moves;
         # the first sample after the switch only sets a baseline.
         phase_changed = state != self._state and prev is not None
+        new_session = False
         if task_changed:
             # A new request took the slot: bank the finished one's numbers.
             self._commit_live()
             if processing and task is not None:
                 self._requests += 1
+                # First request of a session (first ever, or the first after
+                # the server went quiet): consumers use this to reset their
+                # session-scoped min/max.
+                new_session = self._requests == 1
         elif phase_changed:
             self._commit_live()
 
@@ -558,6 +566,7 @@ class LlamaMonitor:
             ctx_used=ctx_used,
             ctx_total=ctx_total,
             requests=self._requests,
+            new_session=new_session,
         )
         self.last_snapshot = snapshot
         return snapshot

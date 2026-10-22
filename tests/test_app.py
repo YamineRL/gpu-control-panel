@@ -13,9 +13,113 @@ import asyncio
 import time
 
 from gpuctl.app import GpuCtlApp
-from gpuctl.graphs import Series, render_chart, render_sparkline
+from gpuctl.graphs import Series, render_chart, render_sparkline, snap_window
 from gpuctl.hwmon import HwmonNotFoundError, HwmonSource
 from gpuctl.llama import InferenceSnapshot
+
+
+def test_snapped_window_scrolls() -> None:
+    """The window must snap to the dot grid, or history gets re-plotted.
+
+    With a free-running window ("now - 5m, now") every column's centre moves
+    by a fraction of a column on every refresh, so the interpolation weights
+    for the whole history change each tick and the curve boils. Snapping the
+    right edge to the grid pins column centres to fixed clock times, so a
+    column only changes when a new sample actually lands in it.
+    """
+    window = 300.0
+    columns = 260  # dot columns for a 130-cell-wide graph
+    step = window / columns
+    base = 1000.0  # arbitrary absolute clock
+
+    # Samples every 2 s, the default probe rate.
+    points = [(base - window + i * 2.0, 60.0 + 10.0 * ((i * 7) % 11 / 10)) for i in range(151)]
+
+    def column_values(t_now: float, snapped: bool) -> str:
+        x0, x1 = (
+            snap_window(t_now, window, columns) if snapped else (t_now - window, t_now)
+        )
+        return render_chart(
+            [Series(points, "cyan", (0, 46, 46))],
+            columns // 2,
+            20,
+            x_range=(x0, x1),
+            y_range=(0.0, 120.0),
+            gutter=False,
+            x_axis=False,
+        ).plain
+
+    # A tick from an unaligned instant: the worst case for a free window.
+    # The data must be a *sloped* line for a re-interpolation to show up; a
+    # flat series interpolates to the same value and would prove nothing.
+    points.clear()
+    points.extend(
+        ((base - window + i * 2.0), 20.0 + 0.35 * i) for i in range(151)
+    )
+
+    t0 = base + 0.37 * step
+    snapped_diff = sum(
+        a != b
+        for a, b in zip(column_values(t0, True), column_values(t0 + 2.0, True))
+    )
+    free_diff = sum(
+        a != b
+        for a, b in zip(column_values(t0, False), column_values(t0 + 2.0, False))
+    )
+    print(f"    tick moved: snapped {snapped_diff} chars, free {free_diff} chars")
+    # Unsnapped the whole diagonal is re-drawn; snapped only the columns that
+    # the new samples actually entered, plus the rightmost cell.
+    assert snapped_diff < free_diff * 0.8, (
+        f"snapping did not stabilise history: {snapped_diff} vs {free_diff}"
+    )
+    # Snapped, only the samples that entered this tick's columns move, so the
+    # redrawn area stays a small fraction of the curve.
+    assert snapped_diff < columns // 2 * 0.5, f"too much redrawn: {snapped_diff}"
+    assert snapped_diff < free_diff, (
+        f"free window redrew no more than the snapped one: {free_diff} vs {snapped_diff}"
+    )
+
+
+def test_session_extremes() -> None:
+    """Tiles track a session min/max that only a new session resets."""
+    from textual.app import App
+
+    from gpuctl.inference import InferenceBar
+
+    bar = InferenceBar()
+
+    def snap(*, gen: float | None, prefill: float | None = None, new_session=False):
+        return InferenceSnapshot(
+            ok=True,
+            model="demo",
+            state="generate" if gen is not None else "idle",
+            gen_tps=gen,
+            prefill_tps=prefill,
+            ctx_used=50,
+            ctx_total=100,
+            new_session=new_session,
+        )
+
+    class Harness(App):
+        def compose(self):
+            yield bar
+
+    async def run() -> None:
+        async with Harness().run_test(size=(120, 8)) as pilot:
+            for index, rate in enumerate((40.0, 12.0, 31.0)):
+                bar.update_snapshot(snap(gen=rate, new_session=index == 0), now=1000.0 + index)
+            await pilot.pause()
+            assert bar._extremes["decode"] == (12.0, 40.0), bar._extremes
+            # A later, narrower value must not shrink the extremes.
+            bar.update_snapshot(snap(gen=20.0), now=1004.0)
+            await pilot.pause()
+            assert bar._extremes["decode"] == (12.0, 40.0), bar._extremes
+            # A new session starts clean instead of carrying old numbers.
+            bar.update_snapshot(snap(gen=20.0, new_session=True), now=1005.0)
+            await pilot.pause()
+            assert bar._extremes["decode"] == (20.0, 20.0), bar._extremes
+
+    asyncio.run(run())
 
 
 def test_graph_render_is_fast() -> None:
@@ -220,6 +324,8 @@ def test_app() -> None:
 
 
 if __name__ == "__main__":
+    test_snapped_window_scrolls()
+    test_session_extremes()
     test_graph_render_is_fast()
     test_sparkline_small()
     test_inference_rates()

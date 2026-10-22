@@ -20,3 +20,8 @@ graft/
 .claude/
 .fusion/
 .ignore
+
+# Pre-rename state files (kept locally as a backup, never published)
+.lact_tui_state
+.lact_tui_probe_interval
+.lact_tui_fancurve.json

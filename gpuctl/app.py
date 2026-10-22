@@ -27,7 +27,7 @@ from textual.widgets import Button, Footer, Header, Static
 
 from .fancurve import FanCurveController, load_config, save_config
 from .gpu_processes import GpuProcessMonitor
-from .graphs import ChartView, Series
+from .graphs import ChartView, Series, snap_window
 from .hwmon import HwmonNotFoundError, HwmonSource, Sample
 from .inference import InferenceBar
 from .llama import InferenceSnapshot, LlamaMonitor
@@ -355,16 +355,20 @@ class GpuCtlApp(App):
             title.append(f"{name}  ", style="grey62")
 
         label = self._timeframe_label()
+        # One dot column per half cell; snapping the window to that grid is
+        # what makes the history scroll left instead of being re-interpolated
+        # from scratch on every probe tick.
+        x_range = snap_window(now, window, graph.size.width * 2)
         graph.set_series(
             series,
-            x_range=(now - window, now),
+            x_range=x_range,
             y_range=(0.0, top),
             title=title,
             ref_line=(junction_crit, "red3") if junction_crit else None,
             x_labels=(
-                (now - window, f"-{label}"),
-                (now - window / 2, f"-{_short_duration(window // 2)}"),
-                (now, "now"),
+                (x_range[0], f"-{label}"),
+                (x_range[0] + (x_range[1] - x_range[0]) / 2, f"-{_short_duration(window // 2)}"),
+                (x_range[1], "now"),
             ),
             y_fmt=lambda value: f"{value:.0f}",
         )
