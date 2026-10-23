@@ -10,9 +10,12 @@ the chart and inference-rate checks run anywhere.
 from __future__ import annotations
 
 import asyncio
+import shlex
+import tempfile
 import time
+from pathlib import Path
 
-from gpuctl.app import GpuCtlApp
+from gpuctl.app import GpuCtlApp, _graph_range, _graph_span, _time_ticks
 from gpuctl.graphs import Series, render_chart, render_sparkline, snap_window
 from gpuctl.hwmon import HwmonNotFoundError, HwmonSource
 from gpuctl.llama import InferenceSnapshot
@@ -137,7 +140,6 @@ def test_graph_render_is_fast() -> None:
             24,
             x_range=(now - 300, now),
             y_range=(0.0, 110.0),
-            ref_line=(95, "red3"),
             x_labels=((now - 300, "-5m"), (now - 150, "-2m30s"), (now, "now")),
         )
     average_ms = (time.perf_counter() - start) / 20 * 1000
@@ -231,6 +233,375 @@ def test_inference_rates() -> None:
         llama.fetch_slots = original_fetch
 
 
+def test_chart_body_is_solid() -> None:
+    """The area under the curves reaches the axis in solid block cells.
+
+    The half-block rewrite once painted every sub-row of a band with its own
+    partial glyph, so each cell ended up as a bottom eighth (``▁``) and the
+    lower half of the chart looked empty. A filled body must be ``█`` all the
+    way down, not a sprinkle of partials.
+    """
+    from gpuctl.graphs import Series, render_chart
+
+    now = 100.0
+    pts = [(now - 60 + i, 50.0 + (i % 5)) for i in range(61)]
+    series = [
+        Series(pts, "cyan", (0, 46, 46)),
+        Series([(t, value + 8) for t, value in pts], "#ff8700", (58, 36, 0)),
+    ]
+    chart = render_chart(
+        series,
+        40,
+        12,
+        x_range=(now - 60, now),
+        y_range=(0.0, 120.0),
+        gutter=False,
+        x_axis=False,
+    )
+    rows = chart.plain.splitlines()
+    assert set(rows[-1]) == {"█"}, rows[-1]
+    assert set(rows[-3]) == {"█"}, rows[-3]
+
+
+def test_chart_body_has_no_black_gaps() -> None:
+    """An inner curve's edge must not punch a hole in the filled body.
+
+    A curve that runs inside a taller curve's body used to be stroked with a
+    bare partial block glyph. The empty part of that cell showed the terminal
+    background, so the fill read as black spots. The cell has to carry the
+    body colour as its background instead.
+    """
+    from gpuctl.graphs import Series, render_chart
+
+    lo = [(float(i), 40.0) for i in range(11)]
+    hi = [(float(i), 90.0) for i in range(11)]
+    chart = render_chart(
+        [Series(lo, "cyan", (0, 46, 46)), Series(hi, "magenta", (46, 0, 46))],
+        24,
+        14,
+        x_range=(0.0, 10.0),
+        y_range=(0.0, 100.0),
+        gutter=False,
+        x_axis=False,
+    )
+    lines = chart.plain.split("\n")
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line) + 1
+
+    def style_at(row: int, column: int):
+        position = offsets[row] + column
+        for span in chart.spans:
+            if span.start <= position < span.end:
+                return span.style
+        return None
+
+    checked = 0
+    for column in range(len(lines[0])):
+        body_top = next(
+            (row for row, line in enumerate(lines) if line[column] != " "), None
+        )
+        if body_top is None:
+            continue
+        for row in range(body_top + 1, len(lines)):
+            if column >= len(lines[row]):
+                continue
+            cell = lines[row][column]
+            if cell in (" ", "\u2588"):
+                continue
+            style = style_at(row, column)
+            assert style is not None and style.bgcolor is not None, (
+                row,
+                column,
+                cell,
+            )
+            checked += 1
+    assert checked, "fixture should have an inner edge inside the body"
+
+
+def _cell_styles(chart):
+    """(plain rows, style_at(row, column)) for a rendered chart."""
+    lines = chart.plain.split("\n")
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line) + 1
+
+    def style_at(row: int, column: int):
+        position = offsets[row] + column
+        found = None
+        for span in chart.spans:
+            if span.start <= position < span.end:
+                found = span.style
+        return found
+
+    return lines, style_at
+
+
+def test_lower_curve_keeps_its_own_body() -> None:
+    """A curve below another one is drawn as its own ridge, down to the floor.
+
+    The old renderer let the tallest curve's fill win every column, so a
+    lower curve was only a stroke floating in someone else's colour. Here
+    the cells under the low curve must carry the low curve's colours, and
+    the cells between the two curves the high curve's.
+    """
+    from rich.color import Color
+
+    from gpuctl.graphs import Series, render_chart
+
+    lo = [(float(i), 30.0) for i in range(11)]
+    hi = [(float(i), 80.0) for i in range(11)]
+    chart = render_chart(
+        [Series(hi, "#ff0000", (60, 0, 0)), Series(lo, "#0000ff", (0, 0, 60))],
+        20,
+        10,
+        x_range=(0.0, 10.0),
+        y_range=(0.0, 100.0),
+        gutter=False,
+        x_axis=False,
+    )
+    lines, style_at = _cell_styles(chart)
+
+    def hue(row: int, column: int) -> str:
+        style = style_at(row, column)
+        color = style.bgcolor or style.color
+        red, _, blue = color.get_truecolor()
+        return "red" if red > blue else "blue"
+
+    column = 10
+    # 30 of 100 over 10 rows: the low edge sits in row 7, the high one in row 2.
+    assert hue(9, column) == "blue", lines
+    assert hue(8, column) == "blue", lines
+    assert hue(5, column) == "red", lines
+    assert hue(3, column) == "red", lines
+    assert isinstance(style_at(9, column).bgcolor, Color), "body needs a background"
+
+
+def test_graph_range_hugs_data() -> None:
+    """The y-axis wraps the data tightly, on round numbers.
+
+    The fill used to run to zero on a fixed scale, so a card idling around
+    45 C left most of the graph empty.
+    """
+    for low, high in ((40.0, 45.0), (53.0, 81.0), (70.0, 96.0)):
+        y_min, y_max = _graph_range(low, high)
+        assert y_min < low and high < y_max, (low, high, y_min, y_max)
+        assert y_min % 5 == 0 and y_max % 5 == 0, (y_min, y_max)
+        assert (high - low) / (y_max - y_min) >= 0.55 or y_max - y_min == 20.0
+    # A critical limit far above the data stays off the axis...
+    assert _graph_range(53.0, 81.0, (110.0,))[1] < 100.0
+    # ...and comes into view once the peak gets within 10 degrees of it.
+    assert _graph_range(53.0, 101.0, (110.0,))[1] >= 110.0
+
+
+def test_crit_line_is_drawn_in_range() -> None:
+    """A threshold inside the y-range shows as a dashed line across the plot."""
+    from gpuctl.graphs import Series, Threshold, render_chart
+
+    pts = [(float(i), 90.0 + i) for i in range(11)]
+    chart = render_chart(
+        [Series(pts, "#ff9a3c", (56, 26, 6))],
+        40,
+        12,
+        x_range=(0.0, 10.0),
+        y_range=(70.0, 115.0),
+        thresholds=[Threshold(110.0)],
+    )
+    dashed = [line for line in chart.plain.splitlines() if line.count("\u254c") > 10]
+    assert len(dashed) == 1, chart.plain
+
+
+def test_time_ticks_are_round_and_end_at_now() -> None:
+    """Time labels fall on round steps back from "now" and do not crowd."""
+    ticks = _time_ticks((1000.0 - 300.0, 1000.0), 120)
+    labels = [label for _, label in ticks]
+    assert labels[-1] == "now"
+    assert labels == ["-5m", "-4m", "-3m", "-2m", "-1m", "now"], labels
+    narrow = _time_ticks((1000.0 - 300.0, 1000.0), 40)
+    assert len(narrow) <= 40 // 16 + 1, narrow
+
+
+def test_axes_chart_scrolls_without_boiling() -> None:
+    """With axis gutter and end labels, snap=True still scrolls the history.
+
+    The plot is narrower than the widget (axis labels left, value labels
+    right). Snapping the window to the widget width instead of the plot
+    width moves every column's bucket on each tick, so the curve boils.
+    """
+    from gpuctl.graphs import Series, render_chart
+
+    base = 1000.0
+    # Sloped with a wobble, so any re-sampling moves some edge glyphs.
+    points = [
+        (base - 300.0 + i * 2.0, 40.0 + 0.2 * i + 1.5 * (i % 3)) for i in range(151)
+    ]
+
+    def plot(now: float, snap: bool) -> list[str]:
+        chart = render_chart(
+            [Series(points, "#38d6f5", (6, 38, 52))],
+            90,
+            16,
+            x_range=(now - 300.0, now),
+            y_range=(35.0, 75.0),
+            y_fmt=lambda v: f"{v:.0f}\u00b0",
+            end_labels=True,
+            snap=snap,
+        )
+        return chart.plain.splitlines()
+
+    def scrolled(before: list[str], after: list[str]) -> bool:
+        """True if ``after`` is ``before`` moved left by 0-2 whole columns."""
+        rows = range(1, 15)  # plot rows only: skip the axis and labels
+        left, right = 4, 80  # inside the axis gutter and the value labels
+        return any(
+            all(after[row][left : right - shift] == before[row][left + shift : right] for row in rows)
+            for shift in (0, 1, 2)
+        )
+
+    for start in (base - 0.73, base + 1.1, base + 2.9):
+        assert scrolled(plot(start, True), plot(start + 2.0, True)), start
+    # Negative control: a free-running window re-samples the history.
+    assert not scrolled(plot(base - 0.73, False), plot(base + 1.27, False))
+
+
+def test_graph_span_fills_width() -> None:
+    """A young history is stretched over the whole width, not a sliver."""
+    assert _graph_span(1000.0, 300.0, None) == 300.0
+    assert _graph_span(1000.0, 300.0, 990.0) == 10.0
+    assert _graph_span(1000.0, 300.0, 100.0) == 300.0  # capped at timeframe
+    assert _graph_span(1000.0, 300.0, 1000.0) == 1.0  # never a zero-width axis
+
+
+def test_llama_swap_shell_wrapper() -> None:
+    """A ``sh -c '... --port 8092'`` command must yield the real port.
+
+    llama-swap wraps Strata that way, so the flags sit inside one quoted
+    argument where an argv parser cannot see them. Guessing the llama.cpp
+    default (8080) there produced a dead candidate and an empty tile strip.
+    """
+    from gpuctl import llama
+
+    cmd = (
+        "sh -c 'cd /srv/strata && exec /srv/strata/.venv/bin/python "
+        "serve/server.py --engine strata --config strata.json "
+        "--port 8092 --api-key test-key'"
+    )
+    argv = llama._unwrap_shell(shlex.split(cmd))
+    target = llama._target_from_argv(argv, origin="llama-swap", default_port=None)
+    assert target is not None
+    assert target.base_url == "http://127.0.0.1:8092", target
+    assert target.engine == "strata", target
+    assert target.api_key == "test-key", target
+
+    # No --port and no proxy: return nothing rather than inventing 8080.
+    none = llama._target_from_argv(
+        shlex.split("python serve/server.py --engine strata"),
+        origin="llama-swap",
+        default_port=None,
+    )
+    assert none is None, none
+
+    # A relative --config resolves against the process working directory.
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "cfg.json").write_text('{"api_key": "from-config"}')
+        target = llama._target_from_argv(
+            ["python", "serve/server.py", "--engine", "strata", "--config", "cfg.json"],
+            origin="strata",
+            cwd=tmp,
+        )
+        assert target is not None and target.api_key == "from-config", target
+
+
+def test_strata_metrics_snapshot() -> None:
+    """Strata's /metrics fills the same tiles from its own live rates."""
+    from gpuctl import llama
+
+    def metrics(
+        state: str,
+        *,
+        prompt=0,
+        read=0,
+        generated=0,
+        tok_s=None,
+        prefill=None,
+        last=None,
+    ) -> dict:
+        return {
+            "engine": {"model": "qwen3.8-flash-next-iq3_xxs", "max_context": 98304},
+            "live": {
+                "state": state,
+                "prompt_tokens": prompt if state != "idle" else None,
+                "prompt_read": read if state == "reading" else None,
+                "prompt_total": prompt if state == "reading" else None,
+                "generated": generated if state != "idle" else None,
+                "elapsed_s": 10.0,
+                "tok_s": tok_s,
+                "tok_s_mean": tok_s,
+                "prefill_tok_s_mean": prefill,
+            },
+            "requests": [last] if last else [],
+        }
+
+    payloads = [
+        metrics("reading", prompt=2048, read=1024, prefill=410.0),
+        metrics("generating", prompt=2064, generated=16, tok_s=42.5, prefill=410.0),
+        metrics(
+            "idle",
+            last={
+                "prompt_tokens": 2048,
+                "prompt_total": 2048,
+                "output_tokens": 96,
+                "decode_tok_s": 40.0,
+            },
+        ),
+    ]
+    monitor = llama.LlamaMonitor()
+    monitor._target = llama.LlamaTarget(
+        base_url="http://fake", origin="strata", engine="strata"
+    )
+    monitor._next_discovery = float("inf")
+    original = llama.fetch_strata_metrics
+    llama.fetch_strata_metrics = lambda target: (payloads.pop(0), None)
+    try:
+        first = monitor.poll()
+        assert first.ok and first.model == "qwen3.8-flash-next-iq3_xxs", first
+        assert first.state == "prefill", first.state
+        assert first.prefill_tps == 410.0 and first.gen_tps is None
+        assert first.prompt_processed == 1024 and first.prompt_total == 2048
+        assert first.ctx_used == 2048 and first.ctx_total == 98304
+        assert first.requests == 1 and first.new_session
+
+        second = monitor.poll()
+        assert second.state == "generate", second.state
+        assert second.gen_tps == 42.5 and second.prefill_tps is None
+        assert second.decoded_tokens == 16
+        assert second.ctx_used == 2080
+        assert second.requests == 1 and not second.new_session
+
+        third = monitor.poll()
+        assert third.state == "idle", third.state
+        assert third.gen_tps is None and third.last_gen_tps == 40.0
+        # The reading rate was banked when the prompt finished, and the idle
+        # view falls back to the newest finished request for context.
+        assert third.last_prefill_tps == 410.0
+        assert third.ctx_used == 2144
+        assert third.new_session is False
+
+        # A failed engine is not a healthy idle server.
+        llama.fetch_strata_metrics = lambda target: (
+            {"engine": {"error": "model unavailable"}, "live": {"state": "error"}},
+            None,
+        )
+        broken = monitor.poll()
+        assert not broken.ok and broken.error == "model unavailable", broken
+    finally:
+        llama.fetch_strata_metrics = original
+
+
 async def _app_checks() -> None:
     try:
         hwmon = HwmonSource.discover()
@@ -291,7 +662,15 @@ async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
         assert app.timeframe_seconds == 3600
         assert elapsed < 0.5, f"timeframe click took {elapsed:.2f}s"
 
-        # Inference tiles: feed a snapshot the way the worker would.
+        # Inference tiles: feed a snapshot the way the worker would. Stop the
+        # live poller first: if a server answers on this machine, its next
+        # snapshot would overwrite these fixed numbers mid-assertion.
+        if app._inference_timer is not None:
+            app._inference_timer.stop()
+        while app._inference_busy:
+            await asyncio.sleep(0.05)
+        await pilot.pause()
+
         bar = app.query_one("#inference-bar")
         bar.display = True
         app._apply_inference(
@@ -328,6 +707,16 @@ if __name__ == "__main__":
     test_session_extremes()
     test_graph_render_is_fast()
     test_sparkline_small()
+    test_chart_body_is_solid()
+    test_chart_body_has_no_black_gaps()
+    test_lower_curve_keeps_its_own_body()
+    test_graph_range_hugs_data()
+    test_crit_line_is_drawn_in_range()
+    test_time_ticks_are_round_and_end_at_now()
+    test_axes_chart_scrolls_without_boiling()
+    test_graph_span_fills_width()
     test_inference_rates()
+    test_llama_swap_shell_wrapper()
+    test_strata_metrics_snapshot()
     test_app()
     print("all checks passed")

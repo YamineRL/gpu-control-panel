@@ -4,7 +4,7 @@
 
 # GPU Control Panel
 
-**AMD GPU fan control in the terminal, with live llama.cpp inference telemetry.**
+**AMD GPU fan control in the terminal, with live llama.cpp / Strata inference telemetry.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -16,17 +16,23 @@
 GPU Control Panel talks to the `amdgpu` hwmon interface in `/sys/class/drm/`
 directly: no daemon, no root service, no plotting library. One Textual app
 draws a btop-style temperature graph, a strip of inference tiles for the
-llama.cpp model currently loaded on the card, and an nvtop-style process
-table, and it drives the fan itself when you want a real curve.
+model currently loaded on the card (llama.cpp or Strata), and an nvtop-style
+process table, and it drives the fan itself when you want a real curve.
 
 <img src="assets/overview.png" width="920" alt="GPU Control Panel main screen: inference tiles, temperature graph, fan and power panels">
 
 ## What it does
 
-- **Live temperature graph.** Edge / junction / memory as three coloured series
-  with a dashed line at the junction critical temperature, a fill under each
-  curve, and switchable timeframes (1m / 5m / 15m / 1h). The last timeframe is
-  remembered between runs.
+- **Live temperature graph.** Edge / junction / memory as layered ridges: a
+  bright edge per sensor fading into its own gradient body, on an axis that
+  hugs the data. Each curve ends in its live value, the window's min and max
+  sit in the title, round time ticks run back from "now", and the critical
+  limit appears as a dashed line once a sensor gets within 10 degrees of it.
+  Switchable timeframes (1m / 5m / 15m / 1h); the last one is remembered
+  between runs.
+- **Probe rate.** The `-` / `+` buttons next to the timeframes set how often
+  hwmon is read, from 500 ms to 10 s in 500 ms steps (2 s by default). The
+  value is remembered between runs.
 - **Inference tiles.** Decode and prefill tokens per second of the model on the
   card, each with a sparkline, plus context use and a model/state tile. See
   [Inference tiles](#inference-tiles).
@@ -39,9 +45,9 @@ table, and it drives the fan itself when you want a real curve.
 - **GPU processes.** `v` opens a table of the processes with a DRM fd on the
   card: user, engine type, GPU%, VRAM, CPU% and command line.
 
-The UI never blocks on a read or a redraw: hwmon, `/slots` and the `/proc`
-scan all run on worker threads, and the charts are braille glyphs rendered in
-about two milliseconds.
+The UI never blocks on a read or a redraw: hwmon, the inference endpoint and
+the `/proc` scan all run on worker threads, and the charts are block glyphs
+rendered in a few milliseconds.
 
 ## Screenshots
 
@@ -103,30 +109,38 @@ Pass `--debug` to show the discovered hwmon path as a startup toast.
 ## Inference tiles
 
 The four tiles above the graph (same idea as the Strata terminal monitor: a
-label, a big value, a small live graph) report the llama.cpp model that is
-loaded on the GPU:
+label, a big value, a small live graph) report the model that is loaded on the
+GPU, from llama.cpp (`llama-server`) or Strata:
 
 | Tile | Shows |
 |------|-------|
 | `DECODE tok/s` | tokens the model is generating right now (the last finished request's rate when idle) |
-| `PREFILL tok/s` | prompt-processing rate (the last finished request's rate when idle) |
+| `PREFILL tok/s` | prompt-processing rate (the rate last observed when idle) |
 | `CONTEXT` | context used / window, as a percentage with a token count |
 | `MODEL` | model name, state (`idle` / `prefill` / `generating`), request count, where the data came from |
 
-Numbers come from llama.cpp's `/slots` endpoint, polled twice a second on a
-worker thread. llama.cpp updates its counters once per batch, so a rate is the
-counter delta divided by the time since that counter last moved; dividing by
-the poll interval would report 2,048 tok/s for a 1,024-token prefill batch that
-arrived after 2.5 s.
+Under each sparkline the tile keeps the session's min and max (rates in tok/s,
+context in %), and the note under the big value says whether the number is
+live or from the last finished request.
+
+Numbers come from llama.cpp's `/slots` endpoint or Strata's `/metrics` JSON,
+polled twice a second on a worker thread. llama.cpp updates its counters once
+per batch, so a rate is the counter delta divided by the time since that
+counter last moved; dividing by the poll interval would report 2,048 tok/s for
+a 1,024-token prefill batch that arrived after 2.5 s. Strata reports its own
+rates (`live.tok_s`, `live.prefill_tok_s_mean`), so those are used as-is.
 
 Nothing needs configuring. The server is found in this order:
 
 1. `GPU_CTL_LLAMA_URL` (with `GPU_CTL_LLAMA_KEY` or `GPU_CTL_LLAMA_KEY_FILE`)
 2. a `llama-server` process owned by you: `--host` / `--port`,
    `--api-key-file` and `-m` are read from `/proc/<pid>/cmdline`, which also
-   works when llama-swap or a script started it
-3. llama-swap on `127.0.0.1:8091` (`/running` lists the child's URL and command)
-4. the usual ports (8080, 8096) with the usual key-file locations
+   works when llama-swap or a script started it; or a Strata server
+   (`serve/server.py --engine strata`), whose port and key come from its flags,
+   its `--config` JSON, or the CLI's `~/.config/strata/api-key`
+3. llama-swap on `127.0.0.1:8091` (`/running` lists the child's URL and
+   command; `sh -c` wrappers are unwrapped)
+4. the usual ports: llama.cpp's 8080 / 8096, Strata's 8092 / 8095
 
 The strip stays hidden while no server answers, so a fan-only view is
 unchanged; it appears by itself once one does. `i` toggles it manually and
@@ -159,12 +173,12 @@ runs a curve inside the app: the GPU goes to manual mode and the app writes
 
 ## Configuration
 
-Two small state files live next to the checkout and are gitignored:
+Three small state files live next to the checkout and are gitignored:
 
 | File | Contents |
 |------|----------|
 | `.gpuctl_state` | last graph timeframe, in seconds |
-| `.gpuctl_probe_interval` | hwmon poll interval in ms (500-5000) |
+| `.gpuctl_probe_interval` | hwmon poll interval in ms (500-10000; set with the `-` / `+` buttons) |
 | `.gpuctl_fancurve.json` | fan curve profiles (written with the defaults on first run) |
 
 To start from a clean, fully commented example instead of the defaults:
@@ -183,10 +197,11 @@ built-in defaults are used. Fields per profile:
 }
 ```
 
-is a `curves` map of `sensor -> [[temp_c, pct], ...]` (ascending temperature),
-next to `min_spin_pct`, `hysteresis_c`, `spin_down_delay_s`,
-`ramp_down_pct_per_s`, `ramp_up_pct_per_s`, `smoothing_s` and `lookahead_s`.
-The top-level keys are `active`, `autostart` and `emergency_margin_c`.
+A profile's `curves` map is `sensor -> [[temp_c, pct], ...]` (ascending
+temperature). The same profile holds `min_spin_pct`, `hysteresis_c`,
+`spin_down_delay_s`, `ramp_down_pct_per_s`, `ramp_up_pct_per_s`, `smoothing_s`
+and `lookahead_s`. The top-level keys are `active`, `autostart` and
+`emergency_margin_c`.
 
 The curve starts when the app opens, so you get the password prompt at
 startup. Cancel it to stay on firmware auto, or set `"autostart": false`. The
@@ -213,7 +228,8 @@ processes holding a DRM file descriptor on the card.
 ## Development
 
 ```sh
-PYTHONPATH=. .venv/bin/python tests/test_app.py     # or: pytest tests/ -q
+PYTHONPATH=. .venv/bin/python tests/test_app.py
+pytest tests/ -q                    # same checks, if pytest is installed
 ```
 
 The chart, sparkline and inference-rate checks run anywhere. The app checks
@@ -233,10 +249,11 @@ run.sh                  venv setup + launch wrapper
 gpuctl/
   hwmon.py              hwmon discovery + sysfs reads (no writes)
   fancurve.py           curve profiles, config file, curve controller
+  gpu_processes.py      DRM fdinfo scan for the GPU process table
   privileged.py         sudo-authenticated writes + the root fan helper
-  graphs.py             braille area charts + sparklines (no plotting library)
+  graphs.py             block-glyph gradient charts + sparklines (no plotting library)
   inference.py          the DECODE / PREFILL / CONTEXT / MODEL tiles
-  llama.py              llama.cpp discovery and live token-rate polling
+  llama.py              inference-server discovery and live token-rate polling
   widgets.py            bordered live-stat side panels
   screens.py            password modal, set-speed modal, "no GPU found" screen
   app.py                the Textual App: layout, workers, keybindings

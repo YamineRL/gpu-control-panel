@@ -1,9 +1,9 @@
-"""Live decode / prefill throughput from a local llama.cpp server.
+"""Live decode / prefill throughput from a local inference server.
 
-GPU Control Panel is a fan-control TUI, but the machine it runs on often has a
-llama.cpp server (`llama-server`, optionally behind `llama-swap`) using
-the same GPU. This module turns that server's `/slots` endpoint into two
-numbers people actually stare at while a model runs:
+GPU Control Panel is a fan-control TUI, but the machine it runs on often has
+an inference server (`llama-server` or Strata, optionally behind `llama-swap`)
+using the same GPU. This module turns that server's telemetry into two numbers
+people actually stare at while a model runs:
 
 - **decode** (generation) tokens per second, sampled live;
 - **prefill** (prompt processing) tokens per second, sampled live;
@@ -11,15 +11,20 @@ numbers people actually stare at while a model runs:
 plus context usage, the model name and a request counter. The last finished
 request's rates are kept so an idle server still shows what it last did.
 
+llama.cpp is read from ``/slots``; Strata (its Python server, ``server.py
+--engine strata``) from ``/metrics``, whose ``live`` block has the same
+counters. The tiles do not care which engine answered.
+
 Discovery is best effort and needs no configuration:
 
 1. ``GPU_CTL_LLAMA_URL`` (+ ``GPU_CTL_LLAMA_KEY`` / ``..._KEY_FILE``) wins.
-2. Any ``llama-server`` process owned by the current user: its ``--port``,
-   ``--api-key-file`` and ``-m`` are read straight from ``/proc/<pid>/cmdline``.
-   That also works when the server was started by hand or by llama-swap.
+2. Any ``llama-server`` or Strata server process owned by the current user: its
+   ``--port``, key (``--api-key-file`` / ``--api-key`` / the Strata config or
+   CLI key file) and ``-m`` are read straight from ``/proc/<pid>``. That also
+   works when the server was started by hand or by llama-swap.
 3. llama-swap on 127.0.0.1:8091: ``/running`` lists the proxy URL and the
-   child command line.
-4. The usual llama.cpp ports (8080, 8096) with the usual key-file locations.
+   child command line, unwrapped from ``sh -c`` when needed.
+4. The usual ports: llama.cpp's 8080 / 8096, Strata's 8092 / 8095.
 
 All HTTP is blocking on purpose: the app calls :meth:`LlamaMonitor.poll`
 from a worker thread, never from the UI thread.
@@ -34,7 +39,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 HTTP_TIMEOUT = 1.0
@@ -51,6 +56,10 @@ KEY_FILE_HINTS = (
     "~/.config/llama-server/api-key.line1",
     "~/.llama-server-api-key",
 )
+# Strata's own default port is 8095; 8092 is where llama-swap runs it here.
+STRATA_DEFAULT_PORTS = (8092, 8095)
+# The file the `strata` CLI itself reads (bin/strata: STRATA_API_KEY).
+STRATA_KEY_HINTS = ("~/.config/strata/api-key",)
 
 # llama.cpp returns 401 without the key, and some builds answer 403.
 AUTH_ERRORS = ("HTTP 401", "HTTP 403")
@@ -58,12 +67,13 @@ AUTH_ERRORS = ("HTTP 401", "HTTP 403")
 
 @dataclass(frozen=True)
 class LlamaTarget:
-    """A llama.cpp server we can talk to."""
+    """An inference server we can talk to (llama.cpp or Strata)."""
 
     base_url: str
     api_key: str | None = None
     model: str = ""
     origin: str = ""
+    engine: str = "llama"  # llama | strata
 
 
 @dataclass(slots=True)
@@ -127,6 +137,74 @@ def _read_key_file(path: str) -> str | None:
     return None
 
 
+def _key_from_hints(hints: tuple[str, ...]) -> str | None:
+    """The first key in the first key file that exists."""
+    for hint in hints:
+        key = _read_key_file(hint)
+        if key:
+            return key
+    return None
+
+
+def _unwrap_shell(argv: list[str]) -> list[str]:
+    """Flatten ``sh -c 'cd DIR && exec CMD'`` into CMD's arguments.
+
+    llama-swap wraps its children that way, and the flags that matter
+    (``--port``, ``--config``) then sit inside one quoted argument where
+    :func:`_arg` cannot see them. ``cd DIR`` is kept so a relative
+    ``--config`` can still be resolved.
+    """
+    shells = ("sh", "bash", "dash", "zsh", "ash")
+    for index, item in enumerate(argv):
+        if item != "-c" or index + 1 >= len(argv):
+            continue
+        if index == 0 or Path(argv[index - 1]).name not in shells:
+            continue
+        inner = argv[index + 1]
+        tokens: list[str] = []
+        for part in inner.replace(";", "&&").split("&&"):
+            try:
+                tokens.extend(shlex.split(part))
+            except ValueError:
+                return argv
+        if tokens:
+            return tokens
+    return argv
+
+
+def _is_strata_argv(argv: list[str]) -> bool:
+    """True for Strata's Python server: ``serve/server.py --engine strata``."""
+    if _arg(argv, "--engine") != "strata":
+        return False
+    return any(Path(token).name == "server.py" for token in argv)
+
+
+def _strata_key(argv: list[str], cwd: str | None = None) -> str | None:
+    """The key Strata accepts, from its own flag, config, or the CLI key file.
+
+    Preferring the server's config over the client file keeps gpuctl working
+    when the two have drifted apart.
+    """
+    key = _arg(argv, "--api-key")
+    if key:
+        # Strata accepts a comma-separated list ("k1,k2"); any one is enough.
+        return key.split(",")[0].strip() or None
+    config = _arg(argv, "--config")
+    if config:
+        path = Path(config).expanduser()
+        if not path.is_absolute() and cwd:
+            path = Path(cwd) / path
+        try:
+            data = json.loads(path.read_text(errors="replace"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            key = data.get("api_key")
+            if isinstance(key, str) and key.strip():
+                return key.split(",")[0].strip()
+    return _key_from_hints(STRATA_KEY_HINTS)
+
+
 def _arg(argv: list[str], *names: str) -> str | None:
     """Find ``--flag value`` or ``--flag=value`` in an argv list."""
     for index, item in enumerate(argv):
@@ -139,8 +217,19 @@ def _arg(argv: list[str], *names: str) -> str | None:
     return None
 
 
-def _target_from_argv(argv: list[str], origin: str, model: str = "") -> LlamaTarget | None:
-    """Build a target from a llama-server command line."""
+def _target_from_argv(
+    argv: list[str],
+    origin: str,
+    model: str = "",
+    default_port: str | None = "8080",
+    cwd: str | None = None,
+) -> LlamaTarget | None:
+    """Build a target from a server command line.
+
+    ``default_port`` is llama-server's 8080 for a real process. llama-swap
+    passes ``None``: its entries carry an explicit proxy URL, and guessing
+    8080 for a child that uses another port produces a dead candidate.
+    """
     if not argv:
         return None
     # Only long flags: on llama-server `-p` is --prompt, not --port, and a
@@ -148,16 +237,20 @@ def _target_from_argv(argv: list[str], origin: str, model: str = "") -> LlamaTar
     host = _arg(argv, "--host", "--listen") or "127.0.0.1"
     if host in ("0.0.0.0", "::", "[::]"):
         host = "127.0.0.1"
-    port = _arg(argv, "--port") or "8080"
-    if not port.isdigit():
+    port = _arg(argv, "--port") or default_port
+    if port is None or not port.isdigit():
         return None
 
-    key: str | None = None
-    key_file = _arg(argv, "--api-key-file")
-    if key_file:
-        key = _read_key_file(key_file)
-    if key is None:
-        key = _arg(argv, "--api-key")
+    engine = "strata" if _is_strata_argv(argv) else "llama"
+    if engine == "strata":
+        key = _strata_key(argv, cwd)
+    else:
+        key = None
+        key_file = _arg(argv, "--api-key-file")
+        if key_file:
+            key = _read_key_file(key_file)
+        if key is None:
+            key = _arg(argv, "--api-key")
 
     if not model:
         model_path = _arg(argv, "-m", "--model") or ""
@@ -170,6 +263,7 @@ def _target_from_argv(argv: list[str], origin: str, model: str = "") -> LlamaTar
         api_key=key,
         model=model,
         origin=origin,
+        engine=engine,
     )
 
 
@@ -187,7 +281,7 @@ def _candidate_from_env() -> list[LlamaTarget]:
 
 
 def _candidate_from_processes() -> list[LlamaTarget]:
-    """Every llama-server owned by this user, newest first."""
+    """Every llama-server or Strata server owned by this user, newest first."""
     found: list[tuple[float, LlamaTarget]] = []
     proc = Path("/proc")
     try:
@@ -204,15 +298,21 @@ def _candidate_from_processes() -> list[LlamaTarget]:
             raw = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if b"llama-server" not in raw:
-            continue
         argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
         if not argv:
             continue
         exe = os.path.basename(argv[0])
-        if exe not in ("llama-server", "llama-server.exe", "rpc-server"):
+        if exe in ("llama-server", "llama-server.exe", "rpc-server"):
+            target = _target_from_argv(argv, origin="llama-server")
+        elif _is_strata_argv(argv):
+            # Strata names --config relative to its working directory.
+            try:
+                cwd = os.readlink(entry / "cwd")
+            except OSError:
+                cwd = None
+            target = _target_from_argv(argv, origin="strata", cwd=cwd)
+        else:
             continue
-        target = _target_from_argv(argv, origin="llama-server")
         if target is None:
             continue
         try:
@@ -238,39 +338,60 @@ def _candidate_from_llama_swap() -> list[LlamaTarget]:
             continue
         cmd = item.get("cmd")
         name = str(item.get("name") or item.get("model") or "")
-        target = None
+        argv: list[str] = []
         if isinstance(cmd, str) and cmd:
             try:
-                target = _target_from_argv(shlex.split(cmd), origin="llama-swap", model=name)
+                argv = _unwrap_shell(shlex.split(cmd))
             except ValueError:
-                target = None
+                argv = []
+        target = None
+        if argv:
+            # The proxy URL is authoritative for llama-swap children; a
+            # missing --port must not fall back to 8080.
+            target = _target_from_argv(
+                argv, origin="llama-swap", model=name, default_port=None
+            )
         if target is None:
             proxy = str(item.get("proxy") or "").rstrip("/")
-            if proxy.startswith("http"):
-                target = LlamaTarget(base_url=proxy, model=name, origin="llama-swap")
-        if target is not None:
-            targets.append(target)
+            if not proxy.startswith("http"):
+                continue
+            target = LlamaTarget(
+                base_url=proxy,
+                model=name,
+                origin="llama-swap",
+                engine="strata" if _is_strata_argv(argv) else "llama",
+            )
+        if target.api_key is None:
+            key = (
+                _strata_key(argv)
+                if target.engine == "strata"
+                else _key_from_hints(KEY_FILE_HINTS)
+            )
+            if key:
+                target = replace(target, api_key=key)
+        targets.append(target)
     return targets
 
 
 def _candidate_from_defaults() -> list[LlamaTarget]:
     targets: list[LlamaTarget] = []
     for port in DEFAULT_PORTS:
-        for hint in KEY_FILE_HINTS:
-            path = Path(hint).expanduser()
-            if not path.exists():
-                continue
-            target = LlamaTarget(
+        targets.append(
+            LlamaTarget(
                 base_url=f"http://127.0.0.1:{port}",
-                api_key=_read_key_file(str(path)),
+                api_key=_key_from_hints(KEY_FILE_HINTS),
                 origin="default port",
             )
-            targets.append(target)
-            break
-        else:
-            targets.append(
-                LlamaTarget(base_url=f"http://127.0.0.1:{port}", origin="default port")
+        )
+    for port in STRATA_DEFAULT_PORTS:
+        targets.append(
+            LlamaTarget(
+                base_url=f"http://127.0.0.1:{port}",
+                api_key=_key_from_hints(STRATA_KEY_HINTS),
+                origin="strata port",
+                engine="strata",
             )
+        )
     return targets
 
 
@@ -305,6 +426,17 @@ def fetch_props(target: LlamaTarget) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def fetch_strata_metrics(target: LlamaTarget) -> tuple[dict | None, str | None]:
+    """Strata's JSON /metrics: engine facts under ``engine``, live counters
+    under ``live``. (``/metrics/prometheus`` is the text format, not this.)"""
+    data, error = _http_json(f"{target.base_url}/metrics", target.api_key)
+    if error is None and not (
+        isinstance(data, dict) and isinstance(data.get("live"), dict)
+    ):
+        return None, "unexpected /metrics payload"
+    return data, error
+
+
 def _slot_decoded(slot: dict) -> int:
     """``n_decoded`` lives in ``next_token`` (a list on current builds)."""
     next_token = slot.get("next_token")
@@ -327,6 +459,17 @@ def _as_int(value) -> int:
         return 0
 
 
+def _as_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    # JSON has no NaN/Infinity, but a stale or hand-written document can.
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
 # ------------------------------------------------------------------ monitor
 
 
@@ -341,11 +484,12 @@ class _Prev:
 
 
 class LlamaMonitor:
-    """Polls one llama.cpp server and derives live token rates.
+    """Polls one inference server and derives live token rates.
 
     Not thread-safe by accident: :meth:`poll` takes an internal lock so the
     Textual worker thread can call it while the UI thread reads
-    :attr:`last_snapshot`.
+    :attr:`last_snapshot`. llama.cpp counters are diffed between polls;
+    Strata reports its own rates in ``/metrics`` and needs no diffing.
     """
 
     def __init__(self) -> None:
@@ -373,27 +517,35 @@ class LlamaMonitor:
 
     def _select_target(self) -> LlamaTarget | None:
         for candidate in discover_targets():
-            slots, error = fetch_slots(candidate)
-            if slots is None:
-                continue
-            if not candidate.model:
-                props = fetch_props(candidate)
-                model = str(props.get("model_alias") or props.get("model_path") or "")
-                name = Path(model).name
-                if name.endswith(".gguf"):
-                    name = name[: -len(".gguf")]
-                candidate = LlamaTarget(
-                    base_url=candidate.base_url,
-                    api_key=candidate.api_key,
-                    model=name,
-                    origin=candidate.origin,
-                )
+            if candidate.engine == "strata":
+                metrics, _ = fetch_strata_metrics(candidate)
+                if metrics is None:
+                    continue
+                if not candidate.model:
+                    engine = metrics.get("engine")
+                    model = str((engine or {}).get("model") or "")
+                    candidate = replace(candidate, model=model)
+            else:
+                slots, _ = fetch_slots(candidate)
+                if slots is None:
+                    continue
+                if not candidate.model:
+                    props = fetch_props(candidate)
+                    model = str(
+                        props.get("model_alias") or props.get("model_path") or ""
+                    )
+                    name = Path(model).name
+                    if name.endswith(".gguf"):
+                        name = name[: -len(".gguf")]
+                    candidate = replace(candidate, model=name)
             self._target = candidate
             self._model = candidate.model
             self._prev = None
             self._live_gen = self._live_prefill = None
             self._last_gen = self._last_prefill = None
             self._requests = 0
+            self._failures = 0
+            self._state = "offline"
             return candidate
         return None
 
@@ -419,28 +571,41 @@ class LlamaMonitor:
         self.last_snapshot = snapshot
         return snapshot
 
+    def _failed(self, error: str) -> InferenceSnapshot:
+        """Count a failed poll and drop a dead target after a few in a row."""
+        self._failures += 1
+        if self._failures >= DROP_AFTER_FAILURES:
+            # Server restarted on another port / with another key.
+            self._target = None
+            self._failures = 0
+            # Give it a moment before scanning /proc and probing again.
+            self._next_discovery = time.monotonic() + 2.0
+        return self._offline(error)
+
     def _poll_locked(self) -> InferenceSnapshot:
         now = time.monotonic()
         if self._target is None:
             # Rediscovery is /proc + a few HTTP probes; do it on an interval,
             # not on every poll, and only while nothing is answering.
             if now < self._next_discovery:
-                return self._offline(self.last_snapshot.error or "no llama.cpp server found")
+                return self._offline(
+                    self.last_snapshot.error or "no inference server found"
+                )
             self._next_discovery = now + REDISCOVER_S
             if self._select_target() is None:
-                return self._offline("no llama.cpp server found")
+                return self._offline("no inference server found")
 
         assert self._target is not None
+        if self._target.engine == "strata":
+            metrics, error = fetch_strata_metrics(self._target)
+            if metrics is None:
+                return self._failed(error or "server did not answer")
+            self._failures = 0
+            return self._strata_snapshot(metrics)
+
         slots, error = fetch_slots(self._target)
         if slots is None:
-            self._failures += 1
-            if self._failures >= DROP_AFTER_FAILURES:
-                # Server restarted on another port / with another key.
-                self._target = None
-                self._failures = 0
-                # Give it a moment before scanning /proc and probing again.
-                self._next_discovery = time.monotonic() + 2.0
-            return self._offline(error or "server did not answer")
+            return self._failed(error or "server did not answer")
         self._failures = 0
 
         processing = False
@@ -565,6 +730,116 @@ class LlamaMonitor:
             decoded_tokens=decoded,
             ctx_used=ctx_used,
             ctx_total=ctx_total,
+            requests=self._requests,
+            new_session=new_session,
+        )
+        self.last_snapshot = snapshot
+        return snapshot
+
+    def _strata_snapshot(self, metrics: dict) -> InferenceSnapshot:
+        """Map one Strata ``/metrics`` document onto the tile fields.
+
+        Strata reports its own rates, so nothing is diffed here. Its ``live``
+        block is empty unless a request is running (``reading`` or
+        ``generating``); the newest finished request fills the idle view.
+        """
+        live = metrics.get("live") if isinstance(metrics.get("live"), dict) else {}
+        engine = (
+            metrics.get("engine") if isinstance(metrics.get("engine"), dict) else {}
+        )
+        recent = [r for r in (metrics.get("requests") or []) if isinstance(r, dict)]
+
+        model = str(engine.get("model") or "")
+        if model:
+            self._model = model
+
+        raw = str(live.get("state") or "idle").lower()
+        failure = engine.get("error")
+        if raw == "error" or failure:
+            message = (
+                failure if isinstance(failure, str) and failure else "engine error"
+            )
+            return self._offline(message)
+        state = {"reading": "prefill", "generating": "generate"}.get(raw, "idle")
+        previous = self._state
+        was_busy = previous in ("prefill", "generate")
+        new_session = state != "idle" and not was_busy
+        if new_session:
+            self._requests += 1
+        self._state = state
+        new_session = new_session and self._requests == 1
+
+        prompt_tokens = max(_as_int(live.get("prompt_tokens")), 0)
+        generated = max(_as_int(live.get("generated")), 0)
+        prompt_total = max(_as_int(live.get("prompt_total")), 0)
+        prompt_processed = max(_as_int(live.get("prompt_read")), 0)
+        ctx_used = prompt_tokens + generated
+
+        if state == "generate":
+            # /metrics keeps prompt_read/prompt_total only while reading.
+            prompt_total = prompt_total or prompt_tokens
+            prompt_processed = prompt_total
+        elif state == "prefill":
+            prompt_total = prompt_total or prompt_tokens
+        elif recent:
+            last = recent[0]  # newest first: Strata serves hist[::-1]
+            prompt_tokens = max(_as_int(last.get("prompt_tokens")), 0)
+            generated = max(_as_int(last.get("output_tokens")), 0)
+            prompt_total = max(_as_int(last.get("prompt_total")), 0) or prompt_tokens
+            prompt_processed = prompt_total
+            ctx_used = prompt_tokens + generated
+
+        gen_tps: float | None = None
+        prefill_tps: float | None = None
+        if state == "generate":
+            gen_tps = _as_float(live.get("tok_s"))
+            if gen_tps is None:
+                gen_tps = _as_float(live.get("tok_s_mean"))
+        elif state == "prefill":
+            prefill_tps = _as_float(live.get("prefill_tok_s_mean"))
+            elapsed = _as_float(live.get("elapsed_s"))
+            if prefill_tps is None and prompt_processed and elapsed:
+                prefill_tps = prompt_processed / elapsed
+
+        # Bank the prefill rate when the prompt is done, the way the llama.cpp
+        # path commits its live rate. A finished request's own prompt_ms also
+        # covers the cache restore, so dividing by it understates a cached
+        # prompt (42 new tokens over 1.5 s) and overstates a cold one.
+        if state == "prefill":
+            if prefill_tps is not None:
+                self._live_prefill = prefill_tps
+        elif previous == "prefill" and self._live_prefill is not None:
+            self._last_prefill = self._live_prefill
+            self._live_prefill = None
+
+        if recent:
+            last = recent[0]  # newest first: Strata serves hist[::-1]
+            decode = _as_float(last.get("decode_tok_s"))
+            if decode is None:
+                output = _as_int(last.get("output_tokens"))
+                decode_ms = _as_float(last.get("decode_ms"))
+                decode = output / (decode_ms / 1000.0) if output and decode_ms else None
+            self._last_gen = decode
+
+        snapshot = InferenceSnapshot(
+            ok=True,
+            error=None,
+            origin=self._target.origin,
+            model=self._model or "strata",
+            state=state,
+            gen_tps=gen_tps,
+            prefill_tps=prefill_tps,
+            last_gen_tps=self._last_gen,
+            last_prefill_tps=self._last_prefill,
+            prompt_tokens=prompt_total + generated,
+            prompt_processed=prompt_processed,
+            prompt_cached=0,
+            prompt_total=prompt_total,
+            decoded_tokens=generated,
+            ctx_used=ctx_used,
+            ctx_total=max(
+                _as_int(engine.get("max_context")), _as_int(engine.get("context"))
+            ),
             requests=self._requests,
             new_session=new_session,
         )

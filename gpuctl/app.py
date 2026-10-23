@@ -12,6 +12,7 @@ manually:
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from pathlib import Path
@@ -27,7 +28,7 @@ from textual.widgets import Button, Footer, Header, Static
 
 from .fancurve import FanCurveController, load_config, save_config
 from .gpu_processes import GpuProcessMonitor
-from .graphs import ChartView, Series, snap_window
+from .graphs import ChartView, Series, Threshold
 from .hwmon import HwmonNotFoundError, HwmonSource, Sample
 from .inference import InferenceBar
 from .llama import InferenceSnapshot, LlamaMonitor
@@ -47,8 +48,8 @@ PROBE_INTERVAL_MIN_MS = 500
 PROBE_INTERVAL_MAX_MS = 10000
 PROBE_INTERVAL_STEP_MS = 500
 
-# How often the llama.cpp server is asked for its slot counters. This runs
-# in a worker thread, so it never competes with rendering or mouse events.
+# How often the inference server is asked for its counters. This runs in a
+# worker thread, so it never competes with rendering or mouse events.
 INFERENCE_INTERVAL_S = 0.5
 
 # The fan curve runs on its own timer so it stays responsive whatever probe
@@ -65,15 +66,77 @@ MAX_SAMPLES = int(TIMEFRAMES[-1][1] / (PROBE_INTERVAL_MIN_MS / 1000)) + 10
 STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_state"
 PROBE_STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_probe_interval"
 
-TEMP_COLORS = {"edge": "cyan", "junction": "#ff8700", "mem": "magenta"}
-# Dimmer variants used for the filled area under each line (btop style: a
-# bright top edge over a dim body). RGB tuples so they don't depend on the
-# terminal's 16-colour palette.
+# Truecolor so the gradient bodies blend the same in every terminal theme.
+TEMP_COLORS = {"edge": "#38d6f5", "junction": "#ff9a3c", "mem": "#e070ff"}
+# Deep tints the bodies fade into under each bright edge.
 TEMP_FILL_COLORS = {
-    "edge": (0, 46, 46),
-    "junction": (58, 36, 0),
-    "mem": (46, 0, 46),
+    "edge": (6, 38, 52),
+    "junction": (56, 26, 6),
+    "mem": (40, 12, 54),
 }
+CRIT_COLOR = "#ff4d5e"
+# Time-axis tick steps, in seconds; the graph picks the smallest that fits.
+TIME_TICK_STEPS = (5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+
+
+def _graph_span(now: float, window: float, oldest: float | None) -> float:
+    """Visible span: the selected timeframe, or all the history there is.
+
+    A five-minute window with ten seconds of samples is a nearly empty graph.
+    Spreading the young history across the full width keeps the body filling
+    the plot, and the span grows to the selected timeframe as samples build
+    up; after that it scrolls as usual.
+    """
+    if oldest is None:
+        return window
+    return min(window, max(now - oldest, 1.0))
+
+
+def _graph_range(
+    low: float, high: float, crits: tuple[float, ...] = ()
+) -> tuple[float, float]:
+    """Y-axis range that hugs the data so the curves use the whole plot.
+
+    Both ends get a little headroom and are rounded out to multiples of 5,
+    so the axis reads cleanly and does not twitch on every probe tick. A
+    critical limit within 10 degrees of the peak pulls the top up to show
+    it, so the danger line is on screen exactly when it matters.
+    """
+    pad = max(2.0, (high - low) * 0.12)
+    y_min = math.floor((low - pad) / 5.0) * 5.0
+    y_max = math.ceil((high + pad) / 5.0) * 5.0
+    while y_max - y_min < 20.0:
+        y_min -= 5.0
+        if y_max - y_min < 20.0:
+            y_max += 5.0
+    for crit in crits:
+        if high >= crit - 10.0:
+            y_max = max(y_max, math.ceil((crit + 2.0) / 5.0) * 5.0)
+    return max(y_min, 0.0), y_max
+
+
+def _time_ticks(
+    x_range: tuple[float, float], columns: int
+) -> list[tuple[float, str]]:
+    """Round time labels counted back from the right edge ("now")."""
+    left, right = x_range
+    span = right - left
+    if span <= 0 or columns <= 0:
+        return [(right, "now")]
+    # Keep at least ~16 columns between labels so they never crowd.
+    most = max(1, columns // 16)
+    step = next(
+        (step for step in TIME_TICK_STEPS if span / step <= most),
+        TIME_TICK_STEPS[-1],
+    )
+    ticks: list[tuple[float, str]] = []
+    k = 0
+    while right - k * step >= left - 1e-6:
+        ticks.append(
+            (right - k * step, "now" if k == 0 else f"-{_short_duration(k * step)}")
+        )
+        k += 1
+    return ticks[::-1]
 
 
 def _short_duration(seconds: int) -> str:
@@ -155,7 +218,7 @@ class ProbeRateBar(Horizontal):
 
 
 class InferenceUpdated(Message):
-    """One llama.cpp snapshot, posted from the poll worker thread.
+    """One inference snapshot, posted from the poll worker thread.
 
     Workers use ``post_message`` rather than ``call_from_thread``: posting is
     thread-safe and never blocks, so a worker that happens to finish while
@@ -272,7 +335,7 @@ class GpuCtlApp(App):
         self.query_one(ProbeRateBar).set_value(self.probe_interval_ms)
         self.query_one(ProcessPanel).display = self.show_processes
         self.query_one(FanPanel).set_profile(self.curve_config.active)
-        # Hidden until a llama.cpp server answers, so a fan-only user does
+        # Hidden until an inference server answers, so a fan-only user does
         # not lose six rows to empty tiles. Polling continues while hidden.
         self.query_one(InferenceBar).display = False
         if self._curve_config_error:
@@ -346,38 +409,48 @@ class GpuCtlApp(App):
                         Series(points, TEMP_COLORS[name], TEMP_FILL_COLORS[name])
                     )
 
-        junction_crit = self.hwmon.limits.temp_crit.get("junction")
-        top = max(90.0, (junction_crit or 100) + 10)
+        values = [value for item in series for _, value in item.points]
+        crit_limits = self.hwmon.limits.temp_crit
+        crits = tuple(
+            crit_limits[name] for name in ("edge", "junction", "mem") if name in crit_limits
+        )
+        if values:
+            y_range = _graph_range(min(values), max(values), crits)
+        else:
+            y_range = (30.0, 60.0)
 
-        title = Text("GPU Temperatures   ", style="bold")
+        title = Text("GPU Temperatures", style="bold")
+        title.append("   ")
         for name in ("edge", "junction", "mem"):
-            title.append("● ", style=TEMP_COLORS[name])
-            title.append(f"{name}  ", style="grey62")
+            title.append("\u2501\u2501 ", style=TEMP_COLORS[name])
+            title.append(f"{name}   ", style="grey66")
+        title_right = Text()
+        if values:
+            title_right.append("min ", style="grey50")
+            title_right.append(f"{min(values):.0f}\u00b0", style="bold grey82")
+            title_right.append("   ")
+            title_right.append("max ", style="grey50")
+            title_right.append(f"{max(values):.0f}\u00b0", style="bold grey82")
+            title_right.append(" ")
 
-        label = self._timeframe_label()
-        # One dot column per half cell; snapping the window to that grid is
-        # what makes the history scroll left instead of being re-interpolated
-        # from scratch on every probe tick.
-        x_range = snap_window(now, window, graph.size.width * 2)
+        # The chart snaps this window to its own plot columns (snap=True):
+        # that is what makes the history scroll left instead of being
+        # re-sampled from scratch on every probe tick.
+        span = _graph_span(
+            now, window, self.samples[0].t if self.samples else None
+        )
         graph.set_series(
             series,
-            x_range=x_range,
-            y_range=(0.0, top),
+            x_range=(now - span, now),
+            snap=True,
+            y_range=y_range,
             title=title,
-            ref_line=(junction_crit, "red3") if junction_crit else None,
-            x_labels=(
-                (x_range[0], f"-{label}"),
-                (x_range[0] + (x_range[1] - x_range[0]) / 2, f"-{_short_duration(window // 2)}"),
-                (x_range[1], "now"),
-            ),
-            y_fmt=lambda value: f"{value:.0f}",
+            title_right=title_right,
+            x_labels=_time_ticks,
+            y_fmt=lambda value: f"{value:.0f}\u00b0",
+            end_labels=True,
+            thresholds=[Threshold(crit, CRIT_COLOR) for crit in sorted(set(crits))],
         )
-
-    def _timeframe_label(self) -> str:
-        for label, seconds in TIMEFRAMES:
-            if seconds == self.timeframe_seconds:
-                return label
-        return f"{self.timeframe_seconds}s"
 
     # ------------------------------------------------------------- inference
 
@@ -432,7 +505,7 @@ class GpuCtlApp(App):
         if self.show_inference and not self._inference_seen:
             # Discovery does network and /proc work; the poller runs it in a
             # worker, so only nudge it instead of probing from here.
-            self.notify("Looking for a llama.cpp server...", timeout=3)
+            self.notify("Looking for an inference server...", timeout=3)
             self._schedule_inference()
         self._apply_inference_visibility()
 
