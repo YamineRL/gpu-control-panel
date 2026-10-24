@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from gpuctl.app import GpuCtlApp, _graph_range, _graph_span, _time_ticks
+from gpuctl.dashboard import Meters
 from gpuctl.graphs import Series, render_chart, render_sparkline, snap_window
 from gpuctl.hwmon import HwmonNotFoundError, HwmonSource
 from gpuctl.llama import InferenceSnapshot
@@ -87,40 +88,196 @@ def test_session_extremes() -> None:
     """Tiles track a session min/max that only a new session resets."""
     from textual.app import App
 
-    from gpuctl.inference import InferenceBar
+    from gpuctl.dashboard import TileGrid
+    from gpuctl.hwmon import GpuLimits, PcieLink
 
-    bar = InferenceBar()
+    grid = TileGrid()
 
-    def snap(*, gen: float | None, prefill: float | None = None, new_session=False):
+    def snap(rate: float) -> InferenceSnapshot:
         return InferenceSnapshot(
             ok=True,
             model="demo",
-            state="generate" if gen is not None else "idle",
-            gen_tps=gen,
-            prefill_tps=prefill,
+            state="generate",
+            gen_tps=rate,
             ctx_used=50,
             ctx_total=100,
-            new_session=new_session,
         )
 
     class Harness(App):
         def compose(self):
-            yield bar
+            yield grid
 
     async def run() -> None:
-        async with Harness().run_test(size=(120, 8)) as pilot:
+        limits = GpuLimits(pwm_min=0, pwm_max=255, fan_min=0, fan_max=0)
+        async with Harness().run_test(size=(120, 18)) as pilot:
+
+            def paint(rate: float, at: float) -> None:
+                grid.push_inference(snap(rate), at)
+                grid.update_tiles(
+                    samples=[], hosts=[], limits=limits, link=PcieLink(), now=at
+                )
+
             for index, rate in enumerate((40.0, 12.0, 31.0)):
-                bar.update_snapshot(snap(gen=rate, new_session=index == 0), now=1000.0 + index)
+                paint(rate, 1000.0 + index)
             await pilot.pause()
-            assert bar._extremes["decode"] == (12.0, 40.0), bar._extremes
+            assert grid.tile("speed").extremes == (12.0, 40.0), grid.tile("speed").extremes
             # A later, narrower value must not shrink the extremes.
-            bar.update_snapshot(snap(gen=20.0), now=1004.0)
+            paint(20.0, 1004.0)
             await pilot.pause()
-            assert bar._extremes["decode"] == (12.0, 40.0), bar._extremes
+            assert grid.tile("speed").extremes == (12.0, 40.0)
             # A new session starts clean instead of carrying old numbers.
-            bar.update_snapshot(snap(gen=20.0, new_session=True), now=1005.0)
+            grid.start_session(1005.0)
+            paint(20.0, 1005.0)
             await pilot.pause()
-            assert bar._extremes["decode"] == (20.0, 20.0), bar._extremes
+            assert grid.tile("speed").extremes == (20.0, 20.0)
+
+    asyncio.run(run())
+
+
+def test_host_readings() -> None:
+    """CPU, RAM, swap and disk are read from /proc-style files, not guessed."""
+    from gpuctl.host import HostSource
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stat = root / "stat"
+        meminfo = root / "meminfo"
+        diskstats = root / "diskstats"
+        block = root / "block"
+        block.mkdir()
+        (block / "nvme0n1").mkdir()
+        # /sys/block lists whole disks only; the partition line below must be
+        # ignored even though /proc/diskstats reports it.
+
+        stat.write_text("cpu  100 0 100 800 0 0 0 0 0 0\n")
+        meminfo.write_text(
+            "MemTotal:       1000 kB\n"
+            "MemAvailable:    250 kB\n"
+            "SwapTotal:       500 kB\n"
+            "SwapFree:        300 kB\n"
+        )
+        diskstats.write_text(
+            "259       0 nvme0n1 10 0 100 0 5 0 40 0 0 0 0\n"
+            "259       1 nvme0n1p1 9 0 90 0 4 0 30 0 0 0 0\n"
+        )
+        source = HostSource(
+            stat_path=str(stat),
+            meminfo_path=str(meminfo),
+            diskstats_path=str(diskstats),
+            block_dir=str(block),
+            cpu_root=str(block),
+        )
+        first = source.read(t=10.0)
+        # No previous counters yet: a rate needs two reads.
+        assert first.cpu_pct is None
+        assert first.disk_read_bps is None
+        assert first.ram_used == 750 * 1024
+        assert first.ram_total == 1000 * 1024
+        assert first.swap_used == 200 * 1024
+        assert first.swap_pct == 40.0
+
+        # Two seconds later: 100 busy jiffies of 1000 total, 6000 sectors read
+        # (a partition's counters must not be added to its disk's).
+        stat.write_text("cpu  200 0 200 1600 0 0 0 0 0 0\n")
+        diskstats.write_text(
+            "259       0 nvme0n1 10 0 6100 0 5 0 8040 0 0 0 0\n"
+            "259       1 nvme0n1p1 9 0 6090 0 4 0 8030 0 0 0 0\n"
+        )
+        second = source.read(t=12.0)
+        assert second.cpu_pct == 20.0, second.cpu_pct
+        assert second.disk_read_bps == 1_536_000.0, second.disk_read_bps
+        assert second.disk_write_bps == 2_048_000.0, second.disk_write_bps
+
+        # No swap configured: a blank bar, not a division by zero.
+        meminfo.write_text("MemTotal: 1000 kB\nMemAvailable: 250 kB\n")
+        third = source.read(t=14.0)
+        assert third.swap_pct is None
+        assert third.swap_total is None
+
+
+def test_pcie_link() -> None:
+    """Gen, width, one-way bandwidth and the idle-link flag come from the rate."""
+    from gpuctl.hwmon import PcieLink, _parse_link_rate
+
+    assert _parse_link_rate("16.0 GT/s PCIe") == 16.0
+    assert _parse_link_rate(None) is None
+    full = PcieLink(
+        speed_gt=16.0, width=16, max_speed_gt=16.0, max_width=16
+    )
+    assert full.generation == 4
+    assert full.bandwidth_gbs == 32.0
+    assert full.downgraded is False
+    # PCIe power management drops the link when the card is idle.
+    idle = PcieLink(speed_gt=2.5, width=16, max_speed_gt=16.0, max_width=16)
+    assert idle.generation == 1
+    assert idle.downgraded is True
+    assert PcieLink().generation is None
+    assert PcieLink().bandwidth_gbs is None
+
+
+def test_request_history() -> None:
+    """Strata's own request list, and its running request, fill the table."""
+    from gpuctl.llama import _history_from_metrics
+
+    recent = [
+        {
+            "time": 1_700_000_000.0,
+            "finish": "stop",
+            "prompt_tokens": 100,
+            "reused": 80,
+            "output_tokens": 20,
+            "decode_tok_s": 25.0,
+            "duration_s": 3.2,
+        }
+    ]
+    idle = _history_from_metrics(recent, "idle", {}, 0, 0)
+    assert len(idle) == 1
+    assert idle[0].status == "stop"
+    assert idle[0].reused_tokens == 80
+    assert idle[0].tok_s == 25.0
+
+    live = {"elapsed_s": 4.0, "reused": 5, "tok_s": 30.0}
+    busy = _history_from_metrics(recent, "generate", live, 100, 50)
+    assert busy[0].status == "running", busy[0]
+    assert busy[0].output_tokens == 50
+    assert busy[1].status == "stop"
+
+
+def test_request_table_fits_its_panel() -> None:
+    """More room under the meters means more request rows, never a spill."""
+    from gpuctl.dashboard import RequestTable
+    from gpuctl.llama import RequestRecord
+    from textual.app import App
+    from textual.widgets import Static
+
+    table = RequestTable()
+
+    class Harness(App):
+        def compose(self):
+            yield table
+
+    async def run() -> None:
+        async with Harness().run_test(size=(56, 12)) as pilot:
+            records = tuple(
+                RequestRecord(
+                    at=1_700_000_000.0 + index,
+                    status="stop",
+                    prompt_tokens=1000 + index,
+                    reused_tokens=900,
+                    output_tokens=120,
+                    tok_s=24.0,
+                    duration_s=5.0,
+                )
+                for index in range(40)
+            )
+            table.update_records(records)
+            await pilot.pause()
+            await pilot.pause()
+            content = table.query_one(Static).render().plain
+            lines = content.splitlines()
+            # Border rows are not content; the panel is 12 tall.
+            assert len(lines) <= 12 - 2, len(lines)
+            assert len(lines) >= 5, len(lines)
 
     asyncio.run(run())
 
@@ -671,8 +828,8 @@ async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
             await asyncio.sleep(0.05)
         await pilot.pause()
 
-        bar = app.query_one("#inference-bar")
-        bar.display = True
+        grid = app.query_one("#tiles")
+        grid.display = True
         app._apply_inference(
             InferenceSnapshot(
                 ok=True,
@@ -687,10 +844,13 @@ async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
             )
         )
         await pilot.pause()
-        value = bar.query_one("#tile-decode .metric-value").render().plain
+        speed = grid.tile("speed")
+        value = speed.query_one(".tile-value").render().plain
         assert "41.2" in value, value
-        prefill_value = bar.query_one("#tile-prefill .metric-value").render().plain
-        assert "1,183" in prefill_value, prefill_value
+        sub = speed.query_one(".tile-sub").render().plain
+        assert "1,183" in sub, sub
+        context = app.query_one(Meters).query_one("#meter-context").render().plain
+        assert "3,200" in context, context
 
         # Pressing i hides the tiles again.
         await pilot.press("i")
@@ -705,6 +865,10 @@ def test_app() -> None:
 if __name__ == "__main__":
     test_snapped_window_scrolls()
     test_session_extremes()
+    test_host_readings()
+    test_pcie_link()
+    test_request_history()
+    test_request_table_fits_its_panel()
     test_graph_render_is_fast()
     test_sparkline_small()
     test_chart_body_is_solid()

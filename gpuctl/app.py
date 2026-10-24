@@ -26,15 +26,16 @@ from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Button, Footer, Header, Static
 
+from .dashboard import Meters, RequestTable, StatusStrip, TileGrid
 from .fancurve import FanCurveController, load_config, save_config
 from .gpu_processes import GpuProcessMonitor
 from .graphs import ChartView, Series, Threshold
+from .host import HostSample, HostSource
 from .hwmon import HwmonNotFoundError, HwmonSource, Sample
-from .inference import InferenceBar
 from .llama import InferenceSnapshot, LlamaMonitor
 from .privileged import RootFanHelper, sudo_write
 from .screens import HwmonMissingApp, PasswordModal, SetSpeedModal
-from .widgets import FanPanel, PowerPanel, ProcessPanel, TempPanel
+from .widgets import ProcessPanel
 
 TIMEFRAMES: list[tuple[str, int]] = [
     ("1m", 60),
@@ -51,6 +52,11 @@ PROBE_INTERVAL_STEP_MS = 500
 # How often the inference server is asked for its counters. This runs in a
 # worker thread, so it never competes with rendering or mouse events.
 INFERENCE_INTERVAL_S = 0.5
+
+# CPU, RAM, swap and disk come from /proc: three small files, read once a
+# second regardless of the GPU probe rate so the host graphs stay smooth.
+HOST_INTERVAL_S = 1.0
+HOST_HISTORY = 3600
 
 # The fan curve runs on its own timer so it stays responsive whatever probe
 # rate the graph uses.
@@ -265,7 +271,7 @@ class GpuCtlApp(App):
         Binding("left_square_bracket", "timeframe_prev", "Timeframe -"),
         Binding("right_square_bracket", "timeframe_next", "Timeframe +"),
         Binding("v", "toggle_processes", "Processes"),
-        Binding("i", "toggle_inference", "Inference"),
+        Binding("i", "toggle_inference", "Tiles"),
         Binding("0", "jump_pct(0)", "0%", show=False),
         Binding("1", "jump_pct(10)", "10%", show=False),
         Binding("2", "jump_pct(20)", "20%", show=False),
@@ -304,12 +310,17 @@ class GpuCtlApp(App):
         self._curve_timer = None
         self._curve_busy = False
         self._last_pwm_written: int | None = None
+        self.host = HostSource()
+        self.host_samples: deque[HostSample] = deque(maxlen=HOST_HISTORY)
+        self._host_timer = None
+        self._snapshot = InferenceSnapshot()
 
     # ------------------------------------------------------------------ UI
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield InferenceBar(id="inference-bar")
+        yield StatusStrip(id="status-strip")
+        yield TileGrid(id="tiles")
         with Horizontal(id="body"):
             with Vertical(id="graph-panel"):
                 with Horizontal(id="graph-toolbar"):
@@ -317,15 +328,14 @@ class GpuCtlApp(App):
                     yield ProbeRateBar(id="probe-rate-bar")
                 yield ChartView(id="graph")
             with Vertical(id="sidebar"):
-                yield TempPanel(id="temp-panel")
-                yield FanPanel(id="fan-panel")
-                yield PowerPanel(id="power-panel")
+                yield Meters(id="meters")
+                yield RequestTable(id="requests")
         yield ProcessPanel(id="process-panel")
         with Vertical(id="control-bar"):
             yield Static(
                 "c = fan curve on/off  |  p = curve profile  |  a = firmware auto  |  "
                 "0-9 / s = manual %  |  [ / ] = timeframe  |  v = processes  |  "
-                "i = inference tiles",
+                "i = tiles",
                 id="control-hint",
             )
         yield Footer()
@@ -334,10 +344,8 @@ class GpuCtlApp(App):
         self.query_one(TimeframeBar).set_active(self.timeframe_seconds)
         self.query_one(ProbeRateBar).set_value(self.probe_interval_ms)
         self.query_one(ProcessPanel).display = self.show_processes
-        self.query_one(FanPanel).set_profile(self.curve_config.active)
-        # Hidden until an inference server answers, so a fan-only user does
-        # not lose six rows to empty tiles. Polling continues while hidden.
-        self.query_one(InferenceBar).display = False
+        self.query_one(Meters).set_profile(self.curve_config.active)
+        self.query_one(TileGrid).display = self.show_inference
         if self._curve_config_error:
             self.notify(
                 f"Fan curve config not loaded, using defaults: {self._curve_config_error}",
@@ -349,7 +357,9 @@ class GpuCtlApp(App):
         if self.debug_mode:
             self.notify(f"hwmon: {self.hwmon.hwmon_dir}", timeout=5)
         self._poll_once()
+        self._poll_host()
         self._restart_poll_timer()
+        self._host_timer = self.set_interval(HOST_INTERVAL_S, self._poll_host)
         self._schedule_inference()
         self._inference_timer = self.set_interval(
             INFERENCE_INTERVAL_S, self._schedule_inference
@@ -370,22 +380,44 @@ class GpuCtlApp(App):
         except OSError:
             return
         self.samples.append(sample)
-        self._update_panels(sample)
+        self._refresh_dashboard()
         self._update_graph()
         if self.show_processes:
             self._scan_processes()
 
-    def _update_panels(self, sample: Sample) -> None:
-        limits = self.hwmon.limits
-        self.query_one(TempPanel).update_sample(sample, limits)
-        pct = self.hwmon.pwm_to_pct(sample.pwm or 0)
-        self.query_one(FanPanel).update_sample(
-            sample,
-            pct,
+    def _poll_host(self) -> None:
+        self.host_samples.append(self.host.read())
+        self._refresh_dashboard()
+
+    def _refresh_dashboard(self) -> None:
+        """Paint the tiles, meters and request table from the latest data."""
+        try:
+            grid = self.query_one(TileGrid)
+            meters = self.query_one(Meters)
+            table = self.query_one(RequestTable)
+            strip = self.query_one(StatusStrip)
+        except Exception:
+            return  # not mounted yet
+        now = time.monotonic()
+        latest_host = self.host_samples[-1] if self.host_samples else None
+        latest_gpu = self.samples[-1] if self.samples else Sample(t=now)
+        grid.update_tiles(
+            samples=self.samples,
+            hosts=self.host_samples,
+            limits=self.hwmon.limits,
+            link=self.hwmon.link,
+            now=now,
+        )
+        meters.update_meters(
+            latest_gpu,
+            latest_host or HostSample(t=now),
+            self._snapshot,
+            self.hwmon.pwm_to_pct(latest_gpu.pwm or 0),
             curve_target=self.curve.pct if self.curve else None,
             curve_emergency=self.curve.emergency if self.curve else False,
         )
-        self.query_one(PowerPanel).update_sample(sample, limits)
+        table.update_records(self._snapshot.history)
+        strip.update_status(self._snapshot, latest_host)
 
     def _update_graph(self) -> None:
         graph = self.query_one("#graph", ChartView)
@@ -482,23 +514,29 @@ class GpuCtlApp(App):
 
     def _apply_inference(self, snapshot: InferenceSnapshot) -> None:
         try:
-            bar = self.query_one(InferenceBar)
+            grid = self.query_one(TileGrid)
         except Exception:
             return  # not mounted yet
+        self._snapshot = snapshot
         if not snapshot.ok and not self._inference_seen:
-            # No server yet: keep the strip hidden and skip painting tiles
-            # nobody can see. Discovery keeps running in the worker.
+            # No server yet: the hardware tiles still fill in from hwmon.
+            self._refresh_dashboard()
             return
-        bar.update_snapshot(snapshot)
         self._inference_seen = True
-        self._apply_inference_visibility()
+        now = time.monotonic()
+        if snapshot.new_session:
+            # A fresh session starts its own min/max instead of carrying the
+            # previous one's numbers into the tiles.
+            grid.start_session(now)
+        grid.push_inference(snapshot, now)
+        self._refresh_dashboard()
 
     def _apply_inference_visibility(self) -> None:
         try:
-            bar = self.query_one(InferenceBar)
+            grid = self.query_one(TileGrid)
         except Exception:
             return
-        bar.display = self.show_inference and self._inference_seen
+        grid.display = self.show_inference
 
     def action_toggle_inference(self) -> None:
         self.show_inference = not self.show_inference
@@ -761,7 +799,7 @@ class GpuCtlApp(App):
             return
         self.curve_config.active = name
         save_config(self.curve_config)
-        self.query_one(FanPanel).set_profile(name)
+        self.query_one(Meters).set_profile(name)
         if self.curve is not None:
             self.curve.set_profile(
                 self.curve_config.profile, self.curve_config.emergency_margin_c

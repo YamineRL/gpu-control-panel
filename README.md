@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/tiles.png" width="920" alt="GPU Control Panel inference tiles: decode and prefill tokens per second, context use, model state">
+<img src="assets/tiles.png" width="920" alt="GPU Control Panel dashboard tiles: speed, the three GPU temperatures, VRAM, power, GPU load, PCIe, CPU and disk">
 
 # GPU Control Panel
 
@@ -15,14 +15,18 @@
 
 GPU Control Panel talks to the `amdgpu` hwmon interface in `/sys/class/drm/`
 directly: no daemon, no root service, no plotting library. One Textual app
-draws a btop-style temperature graph, a strip of inference tiles for the
-model currently loaded on the card (llama.cpp or Strata), and an nvtop-style
-process table, and it drives the fan itself when you want a real curve.
+draws a dashboard of eight live tiles, a btop-style temperature graph, a strip
+of system meters and the recent inference requests, an nvtop-style process
+table, and it drives the fan itself when you want a real curve.
 
-<img src="assets/overview.png" width="920" alt="GPU Control Panel main screen: inference tiles, temperature graph, fan and power panels">
+<img src="assets/overview.png" width="920" alt="GPU Control Panel main screen: eight live tiles, temperature graph, system meters and recent requests">
 
 ## What it does
 
+- **Dashboard tiles.** Two rows of four tiles, each with a big value, a context
+  line, a three-row sparkline and the session's min/max: speed (decode and
+  prefill), the three GPU temperatures, VRAM, power, GPU load, PCIe link,
+  CPU and disk. See [The dashboard](#the-dashboard).
 - **Live temperature graph.** Edge / junction / memory as layered ridges: a
   bright edge per sensor fading into its own gradient body, on an axis that
   hugs the data. Each curve ends in its live value, the window's min and max
@@ -33,21 +37,18 @@ process table, and it drives the fan itself when you want a real curve.
 - **Probe rate.** The `-` / `+` buttons next to the timeframes set how often
   hwmon is read, from 500 ms to 10 s in 500 ms steps (2 s by default). The
   value is remembered between runs.
-- **Inference tiles.** Decode and prefill tokens per second of the model on the
-  card, each with a sparkline, plus context use and a model/state tile. See
-  [Inference tiles](#inference-tiles).
-- **Side panels.** Fan mode, RPM and duty cycle, GPU busy, power draw,
-  VRAM/GTT use and clocks. Temperatures shift green -> yellow -> red as they
-  approach the sensor's critical value.
+- **System meters.** Context fill, system RAM, swap and fan duty as one-line
+  bars, with the fan mode and the curve profile buttons underneath and the
+  recent requests beside them.
 - **Fan control.** Firmware auto, manual, or the app's own fan curve.
   Manual speed via `+` / `-` (5% steps), `0`-`9` (0%-90%), or `s` for an exact
   value. Any manual key stops the curve.
 - **GPU processes.** `v` opens a table of the processes with a DRM fd on the
   card: user, engine type, GPU%, VRAM, CPU% and command line.
 
-The UI never blocks on a read or a redraw: hwmon, the inference endpoint and
-the `/proc` scan all run on worker threads, and the charts are block glyphs
-rendered in a few milliseconds.
+The UI never blocks on a read or a redraw: hwmon, the inference endpoint, the
+`/proc` reads and the process scan all run on worker threads or on short
+timers, and the charts are block glyphs rendered in a few milliseconds.
 
 ## Screenshots
 
@@ -57,7 +58,7 @@ rendered in a few milliseconds.
 <td width="50%"><img src="assets/processes.png" alt="GPU process table"></td>
 </tr>
 <tr>
-<td><em>Live graph, inference tiles, fan and power panels.</em></td>
+<td><em>Tiles, temperature graph, meters and recent requests.</em></td>
 <td><em><code>v</code> opens the process table.</em></td>
 </tr>
 </table>
@@ -104,24 +105,54 @@ Pass `--debug` to show the discovered hwmon path as a startup toast.
 | `s` | Type an exact fan speed |
 | `[` / `]` | Previous / next graph timeframe |
 | `v` | Show / hide the GPU process list |
-| `i` | Show / hide the inference tiles |
+| `i` | Show / hide the dashboard tiles |
 
-## Inference tiles
+## The dashboard
 
-The four tiles above the graph (same idea as the Strata terminal monitor: a
-label, a big value, a small live graph) report the model that is loaded on the
-GPU, from llama.cpp (`llama-server`) or Strata:
+Two rows of four tiles sit above the graph. Every tile has the same shape: a
+big value, one line of context, a three-row sparkline (the last two minutes)
+and the session's min/max underneath. The sparkline scale comes from the
+tile's own data, so a 34 tok/s decode curve fills the box instead of running
+flat along the bottom of a fixed 120 tok/s ceiling.
 
-| Tile | Shows |
-|------|-------|
-| `DECODE tok/s` | tokens the model is generating right now (the last finished request's rate when idle) |
-| `PREFILL tok/s` | prompt-processing rate (the rate last observed when idle) |
-| `CONTEXT` | context used / window, as a percentage with a token count |
-| `MODEL` | model name, state (`idle` / `prefill` / `generating`), request count, where the data came from |
+| Tile | Value | Context line |
+|------|-------|--------------|
+| `SPEED tok/s` | decode rate now (the last request's rate when idle) | prefill rate, and `reading` while a prompt is processed |
+| `GPU TEMP` | edge, junction and memory in one line, coloured by distance to each critical limit | the three critical limits |
+| `VRAM` | used / total GB | GTT use, memory clock |
+| `POWER` | watts now | the cap, core clock |
+| `GPU LOAD` | busy % | memory-controller %, core clock |
+| `PCIe` | link generation and width | one-way bandwidth of the negotiated link, `idle link` when PCIe has dropped it |
+| `CPU` | host CPU % | physical cores, threads, load average |
+| `DISK` | host read rate | write rate |
 
-Under each sparkline the tile keeps the session's min and max (rates in tok/s,
-context in %), and the note under the big value says whether the number is
-live or from the last finished request.
+The `PCIe` tile is the one the driver does not fully answer: amdgpu exposes
+the link's generation and width but no traffic counter, so the value line is
+the link and the graph is the memory controller. When the memory controller is
+busy, data is moving. The tile never shows a `--` next to a dead graph.
+
+Under the tiles, `i` hides the whole grid for a fan-only view.
+
+### Meters and requests
+
+The right column carries four one-line bars and the fan control:
+
+- `CONTEXT`: the inference server's context use.
+- `SYSMEM`: used / total system RAM, from `/proc/meminfo`.
+- `SWAP`: used / total swap, marked `no swap` when the machine has none.
+- `FAN`: duty cycle and RPM.
+
+`MODE` shows the fan's mode (`AUTO (firmware)`, `MANUAL`, `CURVE`, `FULL
+SPEED`), the current duty, the curve's target and a `HOT` marker when the
+curve is in its emergency state. The three profile buttons under it are the
+same as `p`.
+
+`Recent requests` lists the newest first and uses every row the panel has:
+time, state (`run` / `done` / `stop` / `len` / `canc`), prompt tokens, tokens
+reused from the cache, output tokens, tokens per second and duration. Strata
+serves its own request list under `/metrics`; for llama.cpp, which keeps no
+history, the monitor records each request as it finishes and when the slot
+goes idle.
 
 Numbers come from llama.cpp's `/slots` endpoint or Strata's `/metrics` JSON,
 polled twice a second on a worker thread. llama.cpp updates its counters once
@@ -142,9 +173,9 @@ Nothing needs configuring. The server is found in this order:
    command; `sh -c` wrappers are unwrapped)
 4. the usual ports: llama.cpp's 8080 / 8096, Strata's 8092 / 8095
 
-The strip stays hidden while no server answers, so a fan-only view is
-unchanged; it appears by itself once one does. `i` toggles it manually and
-polling continues while it is hidden.
+Without a server the hardware tiles and the meters still fill in from hwmon
+and `/proc`; the speed tile, the context bar and the request table say `--`
+or `no server`, and discovery keeps running.
 
 ## Fan curve
 
@@ -153,7 +184,7 @@ only), and `pwm1_enable=2` is just the SMU firmware's fixed behaviour. So `c`
 runs a curve inside the app: the GPU goes to manual mode and the app writes
 `pwm1` once a second from the temperature readings.
 
-- Three profiles, switched with `p` or the buttons in the Fan panel: `quiet`
+- Three profiles, switched with `p` or the buttons under the meters: `quiet`
   (zero-RPM until about 55C junction, slow spin-down), `balanced`, and `cool`
   (fan always on, steep ramp, reacts early to a fast rise).
 - Each profile has a curve per sensor (junction and memory by default). The fan
@@ -221,9 +252,15 @@ those change across reboots and driver reloads.
 - `power1_average`, `power1_cap*` (display only, never written)
 
 From the sibling device directory (`card*/device/`, not inside `hwmon/`):
-`gpu_busy_percent`, `mem_info_vram_{used,total}`, `mem_info_gtt_{used,total}`,
-`pp_dpm_sclk`, `pp_dpm_mclk`. The process table reads `fdinfo` of the
-processes holding a DRM file descriptor on the card.
+`gpu_busy_percent`, `mem_busy_percent`, `mem_info_vram_{used,total}`,
+`mem_info_gtt_{used,total}`, `pp_dpm_sclk`, `pp_dpm_mclk`, and the PCIe link
+pair `current_link_speed` / `current_link_width` (plus the `max_*` pair, to
+tell a power-managed idle link from a narrowed one). The process table reads
+`fdinfo` of the processes holding a DRM file descriptor on the card.
+
+The host tiles and the memory bars come from `/proc/stat` (CPU jiffies),
+`/proc/meminfo` (RAM and swap) and `/proc/diskstats` (sector counters, whole
+disks only), sampled once a second.
 
 ## Development
 
@@ -248,13 +285,14 @@ main.py                 entry point
 run.sh                  venv setup + launch wrapper
 gpuctl/
   hwmon.py              hwmon discovery + sysfs reads (no writes)
+  host.py               CPU / RAM / swap / disk from /proc
   fancurve.py           curve profiles, config file, curve controller
   gpu_processes.py      DRM fdinfo scan for the GPU process table
   privileged.py         sudo-authenticated writes + the root fan helper
   graphs.py             block-glyph gradient charts + sparklines (no plotting library)
-  inference.py          the DECODE / PREFILL / CONTEXT / MODEL tiles
-  llama.py              inference-server discovery and live token-rate polling
-  widgets.py            bordered live-stat side panels
+  dashboard.py          the tile grid, the meters, the status strip, the request table
+  llama.py              inference-server discovery, live token rates, request history
+  widgets.py            the GPU process table
   screens.py            password modal, set-speed modal, "no GPU found" screen
   app.py                the Textual App: layout, workers, keybindings
   styles.tcss           Textual CSS

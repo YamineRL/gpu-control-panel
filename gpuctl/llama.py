@@ -39,10 +39,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import time as _wall_time
 
 HTTP_TIMEOUT = 1.0
+# How many finished requests the monitor remembers for the table. One row is
+# one request, so this caps scrollback, not screen space.
+HISTORY_RECORDS = 40
 # Re-run process/port discovery at most this often while nothing answers.
 REDISCOVER_S = 10.0
 # A couple of timeouts must pass before dropping a known-good target, so one
@@ -77,6 +82,19 @@ class LlamaTarget:
 
 
 @dataclass(slots=True)
+class RequestRecord:
+    """One inference request, finished or still running, for the table."""
+
+    at: float = 0.0  # wall-clock start, epoch seconds
+    status: str = "done"  # running | done | stop | length | cancelled
+    prompt_tokens: int = 0
+    reused_tokens: int = 0
+    output_tokens: int = 0
+    tok_s: float | None = None
+    duration_s: float | None = None
+
+
+@dataclass(slots=True)
 class InferenceSnapshot:
     """One poll's worth of inference telemetry (all rates in tokens/second)."""
 
@@ -97,6 +115,9 @@ class InferenceSnapshot:
     ctx_used: int = 0
     ctx_total: int = 0
     requests: int = 0
+    # Newest first. Strata serves its own list; for llama.cpp the monitor
+    # records each request as it finishes.
+    history: tuple[RequestRecord, ...] = ()
     # True on the first request of a session, so the tiles can start a fresh
     # min/max instead of carrying the previous session's numbers.
     new_session: bool = False
@@ -507,6 +528,9 @@ class LlamaMonitor:
         self._last_prefill: float | None = None
         self._requests = 0
         self._state = "offline"
+        self._history: deque[RequestRecord] = deque(maxlen=HISTORY_RECORDS)
+        self._pending: RequestRecord | None = None
+        self._pending_started = 0.0
         self.last_snapshot = InferenceSnapshot()
 
     # -- discovery -----------------------------------------------------
@@ -544,6 +568,8 @@ class LlamaMonitor:
             self._live_gen = self._live_prefill = None
             self._last_gen = self._last_prefill = None
             self._requests = 0
+            self._history.clear()
+            self._pending = None
             self._failures = 0
             self._state = "offline"
             return candidate
@@ -566,6 +592,7 @@ class LlamaMonitor:
             last_gen_tps=self._last_gen,
             last_prefill_tps=self._last_prefill,
             requests=self._requests,
+            history=tuple(self._history),
             ctx_total=ctx_total,
         )
         self.last_snapshot = snapshot
@@ -660,14 +687,20 @@ class LlamaMonitor:
         if task_changed:
             # A new request took the slot: bank the finished one's numbers.
             self._commit_live()
+            self._finish_pending()
             if processing and task is not None:
                 self._requests += 1
+                self._start_pending(now, prompt_total, prompt_cached, decoded)
                 # First request of a session (first ever, or the first after
                 # the server went quiet): consumers use this to reset their
                 # session-scoped min/max.
                 new_session = self._requests == 1
         elif phase_changed:
             self._commit_live()
+
+        if processing and self._pending is None:
+            # A request was already running when the app started.
+            self._start_pending(now, prompt_total, prompt_cached, decoded)
 
         reset_baseline = task_changed or phase_changed
         if reset_baseline:
@@ -701,6 +734,11 @@ class LlamaMonitor:
                 self._live_gen = self._gen_ema
                 decoded_at = now
 
+        # After the rate block above: the running row wants this poll's rate,
+        # not the previous poll's.
+        if processing and self._pending is not None:
+            self._update_pending(now, prompt_total, prompt_cached, decoded)
+
         self._prev = _Prev(
             t=now,
             task=task,
@@ -711,6 +749,7 @@ class LlamaMonitor:
         )
         if not processing:
             self._commit_live()
+            self._finish_pending()
         self._state = state
 
         snapshot = InferenceSnapshot(
@@ -731,6 +770,7 @@ class LlamaMonitor:
             ctx_used=ctx_used,
             ctx_total=ctx_total,
             requests=self._requests,
+            history=tuple(self._history),
             new_session=new_session,
         )
         self.last_snapshot = snapshot
@@ -841,6 +881,7 @@ class LlamaMonitor:
                 _as_int(engine.get("max_context")), _as_int(engine.get("context"))
             ),
             requests=self._requests,
+            history=_history_from_metrics(recent, state, live, prompt_tokens, generated),
             new_session=new_session,
         )
         self.last_snapshot = snapshot
@@ -852,6 +893,82 @@ class LlamaMonitor:
         if self._live_prefill is not None:
             self._last_prefill = self._live_prefill
         self._live_gen = self._live_prefill = None
+
+    # -- request history (llama.cpp has no list of its own) -------------
+
+    def _start_pending(
+        self, now: float, prompt: int, reused: int, output: int
+    ) -> None:
+        self._pending = RequestRecord(
+            at=_wall_time(),
+            status="running",
+            prompt_tokens=max(prompt, 0),
+            reused_tokens=max(reused, 0),
+            output_tokens=max(output, 0),
+        )
+        self._pending_started = now
+
+    def _update_pending(
+        self, now: float, prompt: int, reused: int, output: int
+    ) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        pending.prompt_tokens = max(prompt, 0)
+        pending.reused_tokens = max(reused, 0)
+        pending.output_tokens = max(output, 0)
+        pending.tok_s = self._live_gen
+        pending.duration_s = round(now - self._pending_started, 1)
+
+    def _finish_pending(self) -> None:
+        pending = self._pending
+        if pending is None:
+            return
+        pending.status = "done" if pending.output_tokens else "cancelled"
+        self._history.appendleft(pending)
+        self._pending = None
+
+
+def _history_from_metrics(
+    recent: list[dict],
+    state: str,
+    live: dict,
+    prompt_tokens: int,
+    output: int,
+) -> tuple[RequestRecord, ...]:
+    """Map Strata's own request list onto the table's records.
+
+    Strata serves that list newest first and writes the starting wall clock
+    under ``time``, the engine's finish reason under ``finish``.
+    """
+    records: list[RequestRecord] = []
+    for item in recent[:HISTORY_RECORDS]:
+        records.append(
+            RequestRecord(
+                at=_as_float(item.get("time")) or 0.0,
+                status=str(item.get("finish") or "done"),
+                prompt_tokens=_as_int(item.get("prompt_tokens")),
+                reused_tokens=_as_int(item.get("reused")),
+                output_tokens=_as_int(item.get("output_tokens")),
+                tok_s=_as_float(item.get("decode_tok_s")),
+                duration_s=_as_float(item.get("duration_s")),
+            )
+        )
+    if state != "idle":
+        elapsed = _as_float(live.get("elapsed_s")) or 0.0
+        records.insert(
+            0,
+            RequestRecord(
+                at=_wall_time() - elapsed,
+                status="running",
+                prompt_tokens=prompt_tokens,
+                reused_tokens=_as_int(live.get("reused")),
+                output_tokens=output,
+                tok_s=_as_float(live.get("tok_s")),
+                duration_s=round(elapsed, 1) if elapsed else None,
+            ),
+        )
+    return tuple(records)
 
 
 def format_rate(value: float | None, *, compact: bool = False) -> str:

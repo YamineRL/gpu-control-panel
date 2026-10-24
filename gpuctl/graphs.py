@@ -8,7 +8,7 @@ Textual UI thread inside the widget render, so every probe tick froze the
 interface: button clicks were dropped or took seconds to register.
 
 This module draws the picture in a few milliseconds, plus the small
-sparklines used by the inference tiles. It has no dependency beyond Rich.
+sparklines used by the dashboard tiles. It has no dependency beyond Rich.
 
 The look: every curve is a ridge. Its edge is drawn in the bright line
 colour and its body fades down into the series' dark fill colour. Curves are
@@ -577,18 +577,56 @@ def render_sparkline(
     which keeps old points from being rescaled (and the line from jumping
     vertically) on every update.
     """
-    values = [y for _, y in points if math.isfinite(y)]
-    if y_max is not None and math.isfinite(y_max):
-        top = y_max
-    else:
-        top = max(values) if values else 0.0
-        top = max(top, y_floor) * 1.15
-    return render_chart(
+    return render_sparkline_series(
         [Series(points, line, fill)],
         width,
         height,
         x_range=x_range,
-        y_range=(0.0, top),
+        y_floor=y_floor,
+        y_max=y_max,
+    )
+
+
+def render_sparkline_series(
+    series: Sequence[Series],
+    width: int,
+    height: int,
+    *,
+    x_range: tuple[float, float],
+    y_floor: float = 1.0,
+    y_max: float | None = None,
+    y_range: tuple[float, float] | None = None,
+) -> Text:
+    """Same chart for one or more series that share an axis.
+
+    Several sensors drawn together (edge, junction, memory) need one scale:
+    with ``y_range`` the caller decides it, usually the session's own low and
+    high plus a little air, so a 46 C to 64 C band is not flattened onto a
+    0 C to 120 C one.
+    """
+    if y_range is not None:
+        low, high = y_range
+        if not math.isfinite(low) or not math.isfinite(high) or high <= low:
+            low, high = 0.0, max(y_floor, 1.0)
+    else:
+        values = [
+            y
+            for item in series
+            for _, y in item.points
+            if math.isfinite(y)
+        ]
+        low = 0.0
+        if y_max is not None and math.isfinite(y_max):
+            high = y_max
+        else:
+            high = max(values) if values else 0.0
+            high = max(high, y_floor) * 1.15
+    return render_chart(
+        list(series),
+        width,
+        height,
+        x_range=x_range,
+        y_range=(low, high),
         gutter=False,
         x_axis=False,
     )
@@ -671,7 +709,7 @@ class ChartView(Widget):
 
 
 class Sparkline(Widget):
-    """A small scrolling area chart, used by the inference tiles."""
+    """A small scrolling area chart, used by the dashboard tiles."""
 
     can_focus = False
     DEFAULT_CSS = """
@@ -688,6 +726,7 @@ class Sparkline(Widget):
         fill: ColorLike = (0, 70, 70),
         span: float = 120.0,
         y_max: float | None = None,
+        y_floor: float = 1.0,
         name: str | None = None,
         id: str | None = None,
         classes: str | None = None,
@@ -697,34 +736,49 @@ class Sparkline(Widget):
         self._fill = fill
         self._span = span
         self._y_max = y_max
-        self._points: list[tuple[float, float]] = []
+        self._y_floor = y_floor
+        self._series: list[Series] = []
+        self._y_range: tuple[float, float] | None = None
         self._now = 0.0
 
     def update_points(
-        self, points: list[tuple[float, float]], now: float, span: float | None = None
+        self,
+        points: list[tuple[float, float]],
+        now: float,
+        span: float | None = None,
     ) -> None:
-        self._points = points
+        self.set_series([Series(points, self._line, self._fill)], now, span)
+
+    def set_series(
+        self,
+        series: Sequence[Series],
+        now: float,
+        span: float | None = None,
+        y_range: tuple[float, float] | None = None,
+    ) -> None:
+        self._series = list(series)
         self._now = now
         if span is not None:
             self._span = span
+        if y_range is not None:
+            self._y_range = y_range
         self.refresh()
 
     def render(self) -> Text:
         width, height = self.size.width, self.size.height
         if width < 2 or height < 1:
             return Text("")
-        if not self._points:
+        if not any(item.points for item in self._series):
             return Text("")
         # Same snapping as the big graph, so the sparkline scrolls instead of
         # being resampled into a boil.
         x_range = snap_window(self._now, self._span, width)
-        return render_sparkline(
-            self._points,
+        return render_sparkline_series(
+            self._series,
             width,
             height,
             x_range=x_range,
-            line=self._line,
-            fill=self._fill,
-            y_floor=1.0,
+            y_floor=self._y_floor,
             y_max=self._y_max,
+            y_range=self._y_range,
         )

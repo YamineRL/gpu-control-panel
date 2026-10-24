@@ -32,13 +32,13 @@ Screen {
 }
 
 #sidebar {
-    width: 34;
-    min-width: 30;
+    width: 52;
+    min-width: 40;
     padding: 0 1 0 0;
 }
 
 #process-panel {
-    height: 14;
+    height: 12;
     margin: 0 1 1 1;
 }
 
@@ -52,17 +52,4 @@ Screen {
 #control-hint {
     color: $text-muted;
     height: 1;
-}
-
-ProgressBar {
-    width: 100%;
-    margin-top: 1;
-}
-
-ProgressBar > .bar--bar {
-    color: $success;
-}
-
-ProgressBar > .bar--complete {
-    color: $warning;
 }

@@ -49,6 +49,7 @@ class Sample:
     pwm_enable: int | None = None
 
     gpu_busy_pct: int | None = None
+    mem_busy_pct: int | None = None
 
     power_w: float | None = None
 
@@ -59,6 +60,79 @@ class Sample:
 
     sclk_mhz: int | None = None
     mclk_mhz: int | None = None
+
+
+PCIE_GENERATIONS: tuple[tuple[float, int], ...] = (
+    (2.5, 1),
+    (5.0, 2),
+    (8.0, 3),
+    (16.0, 4),
+    (32.0, 5),
+    (64.0, 6),
+)
+
+
+def _parse_link_rate(raw: str | None) -> float | None:
+    """"16.0 GT/s PCIe" -> 16.0. None when the file is missing or odd."""
+    if not raw:
+        return None
+    token = raw.strip().split(" ", 1)[0]
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class PcieLink:
+    """The card's current and maximum PCIe link, as the kernel reports it."""
+
+    speed_gt: float | None = None
+    width: int | None = None
+    max_speed_gt: float | None = None
+    max_width: int | None = None
+
+    @property
+    def generation(self) -> int | None:
+        if self.speed_gt is None:
+            return None
+        for rate, generation in PCIE_GENERATIONS:
+            if abs(self.speed_gt - rate) < 0.25:
+                return generation
+        return None
+
+    @property
+    def max_generation(self) -> int | None:
+        if self.max_speed_gt is None:
+            return None
+        for rate, generation in PCIE_GENERATIONS:
+            if abs(self.max_speed_gt - rate) < 0.25:
+                return generation
+        return None
+
+    @property
+    def bandwidth_gbs(self) -> float | None:
+        """One-direction payload rate of the negotiated link, in GB/s."""
+        if self.speed_gt is None or self.width is None:
+            return None
+        return self.speed_gt * self.width / 8.0
+
+    @property
+    def downgraded(self) -> bool:
+        """True when the link is narrower or slower than the card can do.
+
+        PCIe power management drops the link while the card is idle, so this
+        is a fact about the moment, not a fault.
+        """
+        if self.generation is None or self.max_generation is None:
+            return False
+        if self.generation < self.max_generation:
+            return True
+        return bool(
+            self.width is not None
+            and self.max_width is not None
+            and self.width < self.max_width
+        )
 
 
 @dataclass
@@ -124,6 +198,26 @@ class HwmonSource:
 
     def _dev(self, key: str) -> str:
         return f"{self.device_dir}/{key}"
+
+    @property
+    def link(self) -> PcieLink:
+        """The negotiated PCIe link, read once (the files are cheap but static).
+
+        Lazy so a source built without ``__init__`` (the screenshot renderer)
+        still answers.
+        """
+        cached = getattr(self, "_link", None)
+        if cached is not None:
+            return cached
+        device = getattr(self, "device_dir", "")
+        link = PcieLink(
+            speed_gt=_parse_link_rate(_read_text(f"{device}/current_link_speed")),
+            width=_read_int(f"{device}/current_link_width"),
+            max_speed_gt=_parse_link_rate(_read_text(f"{device}/max_link_speed")),
+            max_width=_read_int(f"{device}/max_link_width"),
+        )
+        self._link = link
+        return link
 
     @property
     def pwm1_path(self) -> str:
@@ -213,6 +307,7 @@ class HwmonSource:
             pwm=pwm,
             pwm_enable=pwm_enable,
             gpu_busy_pct=_read_int(self._dev("gpu_busy_percent")),
+            mem_busy_pct=_read_int(self._dev("mem_busy_percent")),
             power_w=power_w,
             vram_used=_read_int(self._dev("mem_info_vram_used")),
             vram_total=_read_int(self._dev("mem_info_vram_total")),

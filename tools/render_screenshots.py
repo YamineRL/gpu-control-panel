@@ -34,18 +34,19 @@ sys.path.insert(0, str(ROOT))
 import gpuctl.app as app_module  # noqa: E402
 import gpuctl.fancurve as fancurve  # noqa: E402
 from gpuctl.app import GpuCtlApp  # noqa: E402
+from gpuctl.dashboard import TileGrid  # noqa: E402
 from gpuctl.fancurve import CurveConfig  # noqa: E402
 from gpuctl.gpu_processes import GpuProcess  # noqa: E402
-from gpuctl.hwmon import GpuLimits, Sample  # noqa: E402
-from gpuctl.inference import InferenceBar  # noqa: E402
-from gpuctl.llama import InferenceSnapshot  # noqa: E402
+from gpuctl.host import HostSample  # noqa: E402
+from gpuctl.hwmon import GpuLimits, PcieLink, Sample  # noqa: E402
+from gpuctl.llama import InferenceSnapshot, RequestRecord  # noqa: E402
 from gpuctl.widgets import ProcessPanel  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 
 ASSETS = ROOT / "assets"
 SCREEN = (172, 48)
 SCREEN_PROCESSES = (172, 62)
-TILES = (128, 6)
+TILES = (172, 16)
 KEEP_SVG = False
 
 # Everything below is invented; keep it generic so the screenshots stay
@@ -60,7 +61,9 @@ class DemoHwmon:
     """A hardware backend that only supplies limits; readings are injected."""
 
     hwmon_dir = Path("/sys/class/drm/card0/device/hwmon/hwmon0")
+    device_dir = Path("/sys/class/drm/card0/device")
     pci_slot = "0000:03:00.0"
+    _link = PcieLink(speed_gt=16.0, width=16, max_speed_gt=16.0, max_width=16)
     limits = GpuLimits(
         pwm_min=0,
         pwm_max=255,
@@ -75,6 +78,10 @@ class DemoHwmon:
 
     def read_sample(self) -> Sample:  # pragma: no cover - polls are disabled
         raise RuntimeError("the screenshot renderer has no sensor backend")
+
+    @property
+    def link(self) -> PcieLink:
+        return self._link
 
     @staticmethod
     def pwm_to_pct(pwm: int) -> float:
@@ -95,14 +102,40 @@ def _sample(t: float, edge: float, junction: float, mem: float, pct: float) -> S
         pwm=round(pct * 255 / 100),
         pwm_enable=1,
         gpu_busy_pct=99,
-        power_w=267.4,
-        vram_used=19_327_352_832,
-        vram_total=25_769_803_776,
-        gtt_used=2_411_724_800,
-        gtt_total=17_179_869_184,
+        mem_busy_pct=round(18 + pct * 0.55),
+        power_w=round(118.0 + pct * 2.9, 1),
+        vram_used=round((8.4 + pct * 0.10) * GIB),
+        vram_total=24 * GIB,
+        gtt_used=round(2.2 * GIB),
+        gtt_total=16 * GIB,
         sclk_mhz=2418,
         mclk_mhz=1000,
     )
+
+
+def _host(now: float, count: int = 240, step: float = 0.5) -> list[HostSample]:
+    """The machine around the card: busy CPU, 19 of 32 GB, light disk."""
+    rng = random.Random(96)
+    out: list[HostSample] = []
+    for index in range(count):
+        frac = index / (count - 1)
+        cpu = 38.0 + 34.0 * frac + rng.uniform(-4.0, 4.0)
+        out.append(
+            HostSample(
+                t=now - (count - 1 - index) * step,
+                cpu_pct=max(0.0, min(100.0, cpu)),
+                cores=8,
+                threads=16,
+                load1=6.4 + 9.0 * frac,
+                ram_used=int((19.2 + 1.6 * frac) * GIB),
+                ram_total=int(32.0 * GIB),
+                swap_used=int(1.2 * GIB),
+                swap_total=int(8.0 * GIB),
+                disk_read_bps=(12.0 + 240.0 * abs(math.sin(frac * 9.0))) * 1024**2,
+                disk_write_bps=(3.0 + 40.0 * abs(math.cos(frac * 7.0))) * 1024**2,
+            )
+        )
+    return out
 
 
 def _history(now: float, points: int = 150, step: float = 2.0) -> list[Sample]:
@@ -127,7 +160,7 @@ def _history(now: float, points: int = 150, step: float = 2.0) -> list[Sample]:
                 55.0 + 9.2 * load + jitter,
                 64.0 + 15.3 * load + 1.3 * jitter,
                 53.0 + 6.1 * load + 0.7 * jitter,
-                52.0,
+                28.0 + 34.0 * load,
             )
         )
     return out
@@ -197,10 +230,36 @@ def _inference(
                 ctx_used=61_440,
                 ctx_total=CTX_TOTAL,
                 requests=13,
+                history=_requests(now),
             ),
         )
     )
     return snapshots
+
+
+def _requests(now: float) -> tuple[RequestRecord, ...]:
+    """Twelve finished requests, newest first, for the table."""
+    rng = random.Random(3311)
+    rows: list[RequestRecord] = []
+    at = now - 28.0
+    for index in range(12):
+        prompt = rng.randint(6_000, 31_000)
+        reused = round(prompt * rng.uniform(0.0, 0.98))
+        output = rng.randint(90, 2_400)
+        duration = round(output / rng.uniform(18.0, 32.0) + 4.0, 1)
+        rows.append(
+            RequestRecord(
+                at=at,
+                status="length" if index == 4 else "stop",
+                prompt_tokens=prompt,
+                reused_tokens=reused,
+                output_tokens=output,
+                tok_s=round(output / max(duration - 4.0, 1.0), 1),
+                duration_s=duration,
+            )
+        )
+        at -= duration + rng.uniform(120.0, 900.0)
+    return tuple(rows)
 
 
 def _processes() -> list[GpuProcess]:
@@ -285,14 +344,18 @@ def _fill(app: GpuCtlApp) -> None:
     now = time.monotonic()
     app.samples.clear()
     app.samples.extend(_history(now))
+    app.host_samples.clear()
+    app.host_samples.extend(_host(now))
     app.curve = SimpleNamespace(pct=52.0, emergency=False)  # type: ignore[assignment]
-    app._update_panels(app.samples[-1])
-    app._update_graph()
 
-    bar = app.query_one(InferenceBar)
-    for timestamp, snapshot in _inference(now):
-        bar.update_snapshot(snapshot, now=timestamp)
+    grid = app.query_one(TileGrid)
+    snapshots = _inference(now)
+    for timestamp, snapshot in snapshots:
+        grid.push_inference(snapshot, timestamp)
+    app._snapshot = snapshots[-1][1]
     app._inference_seen = True
+    app._refresh_dashboard()
+    app._update_graph()
     app._apply_inference_visibility()
 
 
@@ -319,21 +382,28 @@ async def _render_processes() -> None:
 
 
 class TilesOnly(App[None]):
-    """Just the inference strip, for a legible close-up."""
+    """Just the tile grid, for a legible close-up."""
 
     CSS = "Screen { background: $background; }"
 
     def compose(self) -> ComposeResult:
-        yield InferenceBar()
+        yield TileGrid()
 
 
 async def _render_tiles() -> None:
     app = TilesOnly()
     async with app.run_test(size=TILES) as pilot:
         now = time.monotonic()
-        bar = app.query_one(InferenceBar)
+        grid = app.query_one(TileGrid)
         for timestamp, snapshot in _inference(now):
-            bar.update_snapshot(snapshot, now=timestamp)
+            grid.push_inference(snapshot, timestamp)
+        grid.update_tiles(
+            samples=_history(now),
+            hosts=_host(now),
+            limits=DemoHwmon.limits,
+            link=DemoHwmon._link,
+            now=now,
+        )
         await pilot.pause()
         await pilot.pause()
         _save("tiles", app)
