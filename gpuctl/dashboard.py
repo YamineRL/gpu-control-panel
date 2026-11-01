@@ -285,7 +285,7 @@ class HeroCard(Vertical):
         margin: 0 1 0 0;
     }
     HeroCard #hero-top { height: 3; width: 100%; }
-    HeroCard Digits { width: auto; margin-right: 1; }
+    HeroCard Digits { width: auto; margin-right: 1; text-style: bold; }
     HeroCard .hero-unit { width: auto; height: 3; content-align: left bottom; color: $text-muted; }
     HeroCard Sparkline { width: 1fr; height: 3; margin-left: 1; }
     HeroCard .hero-line { height: 1; width: 100%; text-overflow: ellipsis; }

@@ -6,6 +6,10 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The big numbers in the Focus cards use the bold heavy-line digit font.
+
 ## [1.1.0] - 2026-11-01
 
 ### Added
