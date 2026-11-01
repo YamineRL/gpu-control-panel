@@ -52,6 +52,15 @@ HISTORY_RECORDS = 40
 ARCHIVE_RECORDS = 5000
 # How often the session log is rewritten while there is something new.
 LOG_SAVE_INTERVAL_S = 30.0
+
+# Optional: strata-gate (a queue in front of llama-swap) tags each request
+# with a kind, "compaction" for an opencode summary. Set GPUCTL_GATE_URL=off
+# when no gate runs; without an answer the table just shows no kinds.
+GATE_STATUS_URL = os.environ.get(
+    "GPUCTL_GATE_URL", "http://127.0.0.1:8082/gate/status"
+)
+GATE_RETRY_S = 30.0  # after a failed read, wait this long before the next
+GATE_MATCH_S = 5.0  # gate start and engine start may differ by this much
 # Re-run process/port discovery at most this often while nothing answers.
 REDISCOVER_S = 10.0
 # A couple of timeouts must pass before dropping a known-good target, so one
@@ -96,6 +105,7 @@ class RequestRecord:
     output_tokens: int = 0
     tok_s: float | None = None
     read_s: float | None = None  # time spent reading the prompt
+    kind: str = ""  # "compaction" when the gate marked it, else ""
     duration_s: float | None = None
     # The model that served it. For a "swap" divider, the model swapped to.
     model: str = ""
@@ -539,6 +549,7 @@ class LlamaMonitor:
         self._pending: RequestRecord | None = None
         self._pending_started = 0.0
         self._gen_mark: tuple[float, int] | None = None
+        self._gate_retry_at = 0.0
         # Every finished request since launch, newest first, with a "swap"
         # divider each time the model changes. Survives target changes.
         self._archive: deque[RequestRecord] = deque(maxlen=ARCHIVE_RECORDS)
@@ -634,9 +645,55 @@ class LlamaMonitor:
         self._archive.appendleft(record)
         self._log_dirty = True
 
+    def _gate_starts(self) -> list[tuple[float, str]]:
+        """(start, kind) of the gate's recent requests; [] when no gate."""
+        if GATE_STATUS_URL.lower() in ("", "off", "0", "none"):
+            return []
+        now = time.monotonic()
+        if now < self._gate_retry_at:
+            return []
+        data, error = _http_json(GATE_STATUS_URL, None, timeout=0.3)
+        if error or not isinstance(data, dict):
+            self._gate_retry_at = now + GATE_RETRY_S
+            return []
+        out = []
+        for item in data.get("recent") or []:
+            if isinstance(item, dict) and isinstance(item.get("kind"), str):
+                start = _as_float(item.get("start"))
+                if start:
+                    out.append((start / 1000.0, item["kind"]))
+        return out
+
+    @staticmethod
+    def _kind_for(record: RequestRecord, starts) -> str:
+        best = None
+        for start, kind in starts:
+            gap = abs(start - record.at)
+            if gap <= GATE_MATCH_S and (best is None or gap < best[0]):
+                best = (gap, kind)
+        return "compaction" if best and best[1] == "compaction" else ""
+
+    def _label_kinds(self, running: RequestRecord | None):
+        starts = self._gate_starts()
+        if not starts:
+            return running
+        for index, record in enumerate(self._archive):
+            if record.kind or record.status == "swap":
+                continue
+            kind = self._kind_for(record, starts)
+            if kind:
+                self._archive[index] = replace(record, kind=kind)
+                self._log_dirty = True
+        if running is not None and not running.kind:
+            kind = self._kind_for(running, starts)
+            if kind:
+                running = replace(running, kind=kind)
+        return running
+
     def _with_archive(
         self, running: RequestRecord | None
     ) -> tuple[RequestRecord, ...]:
+        running = self._label_kinds(running)
         records = tuple(self._archive)
         return (running, *records) if running is not None else records
 
@@ -1102,6 +1159,7 @@ def format_session_log(records) -> str:
             f"{stamp} {status_word(record.status):<9} {record.model or '-'} "
             f"prompt={record.prompt_tokens} cached={record.reused_tokens} "
             f"output={record.output_tokens} tok/s={rate} read={read} total={dur}"
+            + (f" kind={record.kind}" if record.kind else "")
         )
     return "\n".join(lines) + "\n"
 

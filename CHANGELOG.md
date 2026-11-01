@@ -15,6 +15,11 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Optional compaction marks: when strata-gate runs, Recent requests labels
+  an opencode summary request as `compact`, so its time stands apart from
+  the next request. gpuctl reads `GPUCTL_GATE_URL` (default
+  `http://127.0.0.1:8082/gate/status`); set it to `off` without a gate.
+
 - **READ column**: how long each request spent reading its prompt, apart
   from the total. A long cache re-read (such as a compaction after a Strata
   reload) is now visible on its own.

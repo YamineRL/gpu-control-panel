@@ -247,6 +247,11 @@ The curve starts when the app opens, so you get the password prompt at
 startup. Cancel it to stay on firmware auto, or set `"autostart": false`. The
 curve runs only while the app is open.
 
+Compaction marks are optional. If a strata-gate queue runs in front of the
+model server, gpuctl reads its `/gate/status` and shows opencode summary
+requests as `compact` in Recent requests. Point `GPUCTL_GATE_URL` at another
+gate, or set `GPUCTL_GATE_URL=off` to skip it. Without a gate nothing changes.
+
 ## Sysfs layout this relies on
 
 Base: `/sys/class/drm/card*/device/hwmon/hwmon*/` where `name` is `amdgpu`.

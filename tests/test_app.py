@@ -354,6 +354,41 @@ def _slot(*, task: int, processed: int, cached: int, prompt: int, decoded: int, 
     }
 
 
+def test_gate_marks_compaction() -> None:
+    """Rows the gate marked as compaction get kind "compaction"; others not.
+
+    With the gate off or unreachable, no row gets a kind.
+    """
+    from gpuctl import llama
+
+    gate = {"recent": [
+        {"kind": "compaction", "start": 1000_000.0},
+        {"kind": "chat", "start": 1600_000.0},
+    ]}
+    original = (llama._http_json, llama.GATE_STATUS_URL)
+    try:
+        llama._http_json = lambda url, key, timeout: (gate, None)
+        monitor = llama.LlamaMonitor()
+        monitor._archive.append(llama.RequestRecord(at=1001.5, status="done"))
+        running = llama.RequestRecord(at=1600.2, status="running")
+        rows = monitor._with_archive(running)
+        kinds = sorted(r.kind for r in rows)
+        assert kinds == ["", "compaction"], rows
+
+        llama.GATE_STATUS_URL = "off"
+        monitor = llama.LlamaMonitor()
+        monitor._archive.append(llama.RequestRecord(at=1001.5, status="done"))
+        assert all(not r.kind for r in monitor._with_archive(None))
+
+        llama.GATE_STATUS_URL = original[1]
+        llama._http_json = lambda url, key, timeout: (None, "refused")
+        monitor = llama.LlamaMonitor()
+        monitor._archive.append(llama.RequestRecord(at=1001.5, status="done"))
+        assert all(not r.kind for r in monitor._with_archive(None))
+    finally:
+        llama._http_json, llama.GATE_STATUS_URL = original
+
+
 def test_history_rate_is_run_mean() -> None:
     """A finished llama.cpp row shows the run's mean decode rate.
 
@@ -1083,6 +1118,7 @@ if __name__ == "__main__":
     test_graph_span_fills_width()
     test_inference_rates()
     test_history_rate_is_run_mean()
+    test_gate_marks_compaction()
     test_llama_swap_shell_wrapper()
     test_strata_metrics_snapshot()
     test_request_rows_stay_on_one_line_at_any_width()

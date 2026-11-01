@@ -1098,7 +1098,7 @@ class RequestTable(Vertical):
     # panel is narrow, so a row never wraps (a wrapped row breaks the table).
     COLUMNS = (
         ("time", "STARTED", 8, "left"),
-        ("state", "STATUS", 6, "left"),
+        ("state", "STATUS", 7, "left"),
         ("prompt", "PROMPT", 6, "right"),
         ("reuse", "CACHED", 6, "right"),
         ("out", "OUTPUT", 6, "right"),
@@ -1189,13 +1189,17 @@ class RequestTable(Vertical):
             if record.at > 0
             else "   --   "
         )
-        label = status_word(record.status)[:6]
+        label = status_word(record.status)[:7]
         style = self.STATE_STYLES.get(label, "grey74")
+        if record.kind == "compaction" and label in ("active", "done"):
+            # A summary request: label it so its time stands apart.
+            style = "spring_green2" if label == "active" else "orchid"
+            label = "compact"
         duration = format_seconds(record.duration_s)
         read = format_seconds(record.read_s)
         cells = {
             "time": (f"{stamp:<8}", "grey62"),
-            "state": (f"{label:<6}", style),
+            "state": (f"{label:<7}", style),
             "prompt": (f"{format_tokens(record.prompt_tokens):>6}", ""),
             "reuse": (
                 f"{format_tokens(record.reused_tokens):>6}"
