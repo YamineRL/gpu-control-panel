@@ -248,7 +248,7 @@ def _fill_bar(pct: float | None, width: int, style: str) -> Text:
 def range_marker(
     value: float | None, low: float | None, high: float | None, width: int
 ) -> Text:
-    """`min 29.7 ├━━━━━🐈🧶──┤ 37.0 max`: where the value sits between min and max.
+    """`min 29.7 ├━━━━━🧶🐈──┤ 37.0 max`: where the value sits between min and max.
 
     A cat chases a ball of wool along the track; the ball marks the current
     value. The track behind the cat is green near max and orange near min,
@@ -259,7 +259,8 @@ def range_marker(
         line.append("min --  max --", style="grey50")
         return line
     left, right = f"min {low:.1f} ", f" {high:.1f} max"
-    marker = "🐈🧶"
+    # The cat emoji faces left: ball first, so the cat looks at it.
+    marker = "🧶🐈"
     marker_cells = cell_len(marker)
     track = max(width - len(left) - len(right) - 2, marker_cells + 1)
     share = 1.0 if high <= low else (value - low) / (high - low)
