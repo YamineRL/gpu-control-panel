@@ -6,6 +6,12 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Recent requests: the TOK/S column shows the mean decode rate of each run
+  (tokens over generate time), not the last smoothed reading. A running
+  Strata row uses Strata's own mean.
+
 ## [1.1.42] - 2026-11-01
 
 ### Changed

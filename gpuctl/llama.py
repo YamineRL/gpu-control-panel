@@ -537,6 +537,7 @@ class LlamaMonitor:
         self._history: deque[RequestRecord] = deque(maxlen=HISTORY_RECORDS)
         self._pending: RequestRecord | None = None
         self._pending_started = 0.0
+        self._gen_mark: tuple[float, int] | None = None
         # Every finished request since launch, newest first, with a "swap"
         # divider each time the model changes. Survives target changes.
         self._archive: deque[RequestRecord] = deque(maxlen=ARCHIVE_RECORDS)
@@ -807,7 +808,7 @@ class LlamaMonitor:
         # After the rate block above: the running row wants this poll's rate,
         # not the previous poll's.
         if processing and self._pending is not None:
-            self._update_pending(now, prompt_total, prompt_cached, decoded)
+            self._update_pending(now, prompt_total, prompt_cached, decoded, state)
 
         self._prev = _Prev(
             t=now,
@@ -978,9 +979,10 @@ class LlamaMonitor:
             output_tokens=max(output, 0),
         )
         self._pending_started = now
+        self._gen_mark = None
 
     def _update_pending(
-        self, now: float, prompt: int, reused: int, output: int
+        self, now: float, prompt: int, reused: int, output: int, state: str = ""
     ) -> None:
         pending = self._pending
         if pending is None:
@@ -988,7 +990,16 @@ class LlamaMonitor:
         pending.prompt_tokens = max(prompt, 0)
         pending.reused_tokens = max(reused, 0)
         pending.output_tokens = max(output, 0)
-        pending.tok_s = self._live_gen
+        # Mean decode rate of the run: tokens since the first generate poll
+        # over the time since. The live EMA only shows the last batches.
+        if state == "generate":
+            if self._gen_mark is None:
+                self._gen_mark = (now, output)
+            t0, d0 = self._gen_mark
+            if now > t0 and output > d0:
+                pending.tok_s = (output - d0) / (now - t0)
+            elif pending.tok_s is None:
+                pending.tok_s = self._live_gen
         pending.duration_s = round(now - self._pending_started, 1)
 
     def _finish_pending(self) -> None:
@@ -1053,7 +1064,8 @@ def _history_from_metrics(
                 prompt_tokens=prompt_tokens,
                 reused_tokens=_as_int(live.get("reused")),
                 output_tokens=output,
-                tok_s=_as_float(live.get("tok_s")),
+                tok_s=_as_float(live.get("tok_s_mean"))
+                or _as_float(live.get("tok_s")),
                 duration_s=round(elapsed, 1) if elapsed else None,
             ),
         )

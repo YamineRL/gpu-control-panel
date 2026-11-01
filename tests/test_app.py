@@ -347,6 +347,50 @@ def _slot(*, task: int, processed: int, cached: int, prompt: int, decoded: int, 
     }
 
 
+def test_history_rate_is_run_mean() -> None:
+    """A finished llama.cpp row shows the run's mean decode rate.
+
+    Decoding runs at 40 tok/s, then slows to 10 tok/s. The live EMA ends
+    near 21; the run's mean from the first generate poll is 100 tokens over
+    4 s, 25 tok/s. The row must show the mean.
+    """
+    from gpuctl import llama
+
+    clock = {"t": 100.0}
+    payloads: list[list[dict]] = []
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return clock["t"]
+
+    monitor = llama.LlamaMonitor()
+    monitor._target = llama.LlamaTarget(base_url="http://fake", model="test.gguf")
+    monitor._next_discovery = float("inf")
+    original_time, original_fetch = llama.time, llama.fetch_slots
+    llama.time = FakeTime
+    llama.fetch_slots = lambda target: ((payloads.pop(0) if payloads else []), None)
+    try:
+        steps = [
+            (0.0, _slot(task=1, processed=0, cached=0, prompt=100, decoded=0)),
+            (1.0, _slot(task=1, processed=100, cached=0, prompt=120, decoded=20)),
+            (2.0, _slot(task=1, processed=100, cached=0, prompt=160, decoded=60)),
+            (3.0, _slot(task=1, processed=100, cached=0, prompt=200, decoded=100)),
+            (4.0, _slot(task=1, processed=100, cached=0, prompt=210, decoded=110)),
+            (5.0, _slot(task=1, processed=100, cached=0, prompt=220, decoded=120)),
+            (6.0, _slot(task=1, processed=0, cached=0, prompt=0, decoded=0, processing=False)),
+        ]
+        for moment, slot in steps:
+            clock["t"] = 100.0 + moment
+            payloads.append([slot])
+            snapshot = monitor.poll()
+        record = snapshot.history[0]
+        assert record.output_tokens == 120, record
+        assert record.tok_s is not None and 24.5 <= record.tok_s <= 25.5, record.tok_s
+    finally:
+        llama.time, llama.fetch_slots = original_time, original_fetch
+
+
 def test_inference_rates() -> None:
     """Prefill/decode rates come from counter deltas over the right window.
 
@@ -1031,6 +1075,7 @@ if __name__ == "__main__":
     test_axes_chart_scrolls_without_boiling()
     test_graph_span_fills_width()
     test_inference_rates()
+    test_history_rate_is_run_mean()
     test_llama_swap_shell_wrapper()
     test_strata_metrics_snapshot()
     test_request_rows_stay_on_one_line_at_any_width()
