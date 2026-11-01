@@ -33,7 +33,7 @@ Screen {
 }
 
 #sidebar {
-    width: 58;
+    width: 60;
     min-width: 40;
     padding: 0 1 0 0;
 }

@@ -247,6 +247,7 @@ def test_request_history() -> None:
             "reused": 80,
             "output_tokens": 20,
             "decode_tok_s": 25.0,
+            "prompt_ms": 333356.2,
             "duration_s": 3.2,
         }
     ]
@@ -255,6 +256,12 @@ def test_request_history() -> None:
     assert idle[0].status == "stop"
     assert idle[0].reused_tokens == 80
     assert idle[0].tok_s == 25.0
+    # Prompt read time is its own number: a long re-read is visible.
+    assert idle[0].read_s == 333.4, idle[0].read_s
+    from gpuctl.llama import format_seconds, status_word
+    assert status_word("stop") == "done" and status_word("length") == "limit"
+    assert [format_seconds(v) for v in (3.2, 518.7, 3725)] == ["3.2s", "8m39s", "1h02m"]
+    assert format_seconds(1500) == "25m"
 
     live = {"elapsed_s": 4.0, "reused": 5, "tok_s": 30.0}
     busy = _history_from_metrics(recent, "generate", live, 100, 50)
@@ -759,7 +766,7 @@ def test_request_rows_stay_on_one_line_at_any_width() -> None:
                            tok_s=24.0, duration_s=104.9)
 
     async def run() -> None:
-        for width in (62, 46, 36):
+        for width in (64, 46, 36):
             async with Harness().run_test(size=(width, 12)) as pilot:
                 table.update_records((record,) * 5)
                 await pilot.pause()
@@ -767,10 +774,10 @@ def test_request_rows_stay_on_one_line_at_any_width() -> None:
                 room = table.query_one("#req-head").size.width - 1
                 for line in table.query_one("#req-body", Static).render().plain.splitlines():
                     assert len(line) <= room, (width, len(line), room)
-                if width >= 62:
-                    assert len(table._columns) == 7
+                if width >= 64:
+                    assert len(table._columns) == len(table.COLUMNS)
                 else:
-                    assert len(table._columns) < 7
+                    assert len(table._columns) < len(table.COLUMNS)
 
     asyncio.run(run())
 

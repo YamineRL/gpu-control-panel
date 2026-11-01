@@ -95,6 +95,7 @@ class RequestRecord:
     reused_tokens: int = 0
     output_tokens: int = 0
     tok_s: float | None = None
+    read_s: float | None = None  # time spent reading the prompt
     duration_s: float | None = None
     # The model that served it. For a "swap" divider, the model swapped to.
     model: str = ""
@@ -995,6 +996,7 @@ class LlamaMonitor:
         if state == "generate":
             if self._gen_mark is None:
                 self._gen_mark = (now, output)
+                pending.read_s = round(now - self._pending_started, 1)
             t0, d0 = self._gen_mark
             if now > t0 and output > d0:
                 pending.tok_s = (output - d0) / (now - t0)
@@ -1029,6 +1031,11 @@ class LlamaMonitor:
         return self._with_archive(running)
 
 
+def _ms_to_s(value) -> float | None:
+    ms = _as_float(value)
+    return round(ms / 1000.0, 1) if ms is not None else None
+
+
 def _history_from_metrics(
     recent: list[dict],
     state: str,
@@ -1051,6 +1058,7 @@ def _history_from_metrics(
                 reused_tokens=_as_int(item.get("reused")),
                 output_tokens=_as_int(item.get("output_tokens")),
                 tok_s=_as_float(item.get("decode_tok_s")),
+                read_s=_ms_to_s(item.get("prompt_ms")),
                 duration_s=_as_float(item.get("duration_s")),
             )
         )
@@ -1081,7 +1089,7 @@ def _session_log_path() -> Path | None:
 
 def format_session_log(records) -> str:
     """Plain text, oldest first, one line per request, a rule per swap."""
-    lines = ["# gpuctl request log: time state model prompt reused out tok/s dur"]
+    lines = ["# gpuctl request log: started status model prompt cached output tok/s read total"]
     for record in records:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.at))
         if record.status == "swap":
@@ -1089,12 +1097,46 @@ def format_session_log(records) -> str:
             continue
         rate = f"{record.tok_s:.1f}" if record.tok_s is not None else "-"
         dur = f"{record.duration_s:.1f}s" if record.duration_s is not None else "-"
+        read = f"{record.read_s:.1f}s" if record.read_s is not None else "-"
         lines.append(
-            f"{stamp} {record.status:<9} {record.model or '-'} "
-            f"prompt={record.prompt_tokens} reused={record.reused_tokens} "
-            f"out={record.output_tokens} tok/s={rate} dur={dur}"
+            f"{stamp} {status_word(record.status):<9} {record.model or '-'} "
+            f"prompt={record.prompt_tokens} cached={record.reused_tokens} "
+            f"output={record.output_tokens} tok/s={rate} read={read} total={dur}"
         )
     return "\n".join(lines) + "\n"
+
+
+# Plain words for the engines' finish reasons ("stop" is the OpenAI name
+# for a normal end).
+STATUS_WORDS = {
+    "running": "active",
+    "done": "done",
+    "stop": "done",
+    "tool_calls": "done",
+    "length": "limit",
+    "cancelled": "cancel",
+    "error": "failed",
+}
+
+
+def status_word(status: str) -> str:
+    return STATUS_WORDS.get(status, status)
+
+
+def format_seconds(value: float | None) -> str:
+    """Short duration, five characters at most: 12.3s, 8m39s, 52m, 1h02m."""
+    if value is None:
+        return "--"
+    value = max(value, 0.0)
+    if value < 59.95:
+        return f"{value:.1f}s"
+    if value < 599.5:
+        minutes, seconds = divmod(int(round(value)), 60)
+        return f"{minutes}m{seconds:02d}s"
+    if value < 3600:
+        return f"{int(round(value)) // 60}m"
+    hours, minutes = divmod(int(round(value)) // 60, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def format_rate(value: float | None, *, compact: bool = False) -> str:

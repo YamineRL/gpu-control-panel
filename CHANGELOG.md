@@ -6,6 +6,19 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Recent requests speak plainly: STARTED, STATUS, CACHED, OUTPUT and TOTAL
+  replace TIME, STATE, REUSE, OUT and DUR. Statuses read active, done, limit,
+  cancel and failed (Strata's "stop" is a normal end, so it shows as done).
+  Durations read 12.3s, 8m39s or 52m. The session log uses the same words.
+
+### Added
+
+- **READ column**: how long each request spent reading its prompt, apart
+  from the total. A long cache re-read (such as a compaction after a Strata
+  reload) is now visible on its own.
+
 ## [1.1.42] - 2026-11-01
 
 ### Changed

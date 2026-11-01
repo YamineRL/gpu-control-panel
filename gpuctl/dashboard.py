@@ -29,7 +29,14 @@ from .fancurve import PROFILE_ORDER
 from .graphs import Series, Sparkline
 from .hwmon import GpuLimits, PcieLink, Sample
 from .host import HostSample
-from .llama import InferenceSnapshot, RequestRecord, format_rate, format_tokens
+from .llama import (
+    InferenceSnapshot,
+    RequestRecord,
+    format_rate,
+    format_seconds,
+    format_tokens,
+    status_word,
+)
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -1090,15 +1097,16 @@ class RequestTable(Vertical):
     # key, header, width, justify. Dropped right to left of PRIORITY when the
     # panel is narrow, so a row never wraps (a wrapped row breaks the table).
     COLUMNS = (
-        ("time", "TIME", 8, "left"),
-        ("state", "STATE", 6, "left"),
+        ("time", "STARTED", 8, "left"),
+        ("state", "STATUS", 6, "left"),
         ("prompt", "PROMPT", 6, "right"),
-        ("reuse", "REUSE", 5, "right"),
-        ("out", "OUT", 5, "right"),
+        ("reuse", "CACHED", 6, "right"),
+        ("out", "OUTPUT", 6, "right"),
         ("rate", "TOK/S", 5, "right"),
-        ("dur", "DUR", 6, "right"),
+        ("read", "READ", 5, "right"),
+        ("dur", "TOTAL", 5, "right"),
     )
-    DROP_ORDER = ("reuse", "dur", "state", "prompt")
+    DROP_ORDER = ("reuse", "read", "state", "dur", "prompt")
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -1166,13 +1174,11 @@ class RequestTable(Vertical):
 
     # What the table calls a request's state. Long words would push the
     # columns apart in a 52-column panel.
-    STATE_LABELS = {
-        "running": ("run", "spring_green2"),
-        "done": ("done", "grey74"),
-        "stop": ("stop", "grey74"),
-        "length": ("len", "yellow"),
-        "cancelled": ("canc", "indian_red"),
-        "error": ("err", "indian_red"),
+    STATE_STYLES = {
+        "active": "spring_green2",
+        "limit": "yellow",
+        "cancel": "indian_red",
+        "failed": "indian_red",
     }
 
     def _row(self, record: RequestRecord) -> Text:
@@ -1183,25 +1189,24 @@ class RequestTable(Vertical):
             if record.at > 0
             else "   --   "
         )
-        label, style = self.STATE_LABELS.get(
-            record.status, (record.status[:6], "grey74")
-        )
-        duration = (
-            f"{record.duration_s:,.1f}s" if record.duration_s is not None else "--"
-        )
+        label = status_word(record.status)[:6]
+        style = self.STATE_STYLES.get(label, "grey74")
+        duration = format_seconds(record.duration_s)
+        read = format_seconds(record.read_s)
         cells = {
             "time": (f"{stamp:<8}", "grey62"),
             "state": (f"{label:<6}", style),
             "prompt": (f"{format_tokens(record.prompt_tokens):>6}", ""),
             "reuse": (
-                f"{format_tokens(record.reused_tokens):>5}"
+                f"{format_tokens(record.reused_tokens):>6}"
                 if record.reused_tokens
-                else f"{'--':>5}",
+                else f"{'--':>6}",
                 "grey62",
             ),
-            "out": (f"{format_tokens(record.output_tokens):>5}", ""),
+            "out": (f"{format_tokens(record.output_tokens):>6}", ""),
             "rate": (f"{format_rate(record.tok_s):>5}", "grey62"),
-            "dur": (f"{duration:>6}", "grey62"),
+            "read": (f"{read:>5}", "grey62"),
+            "dur": (f"{duration:>5}", "grey62"),
         }
         row = Text()
         for index, column in enumerate(self._columns):
