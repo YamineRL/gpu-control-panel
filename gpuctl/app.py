@@ -437,7 +437,10 @@ class GpuCtlApp(App):
             self.query_one(HostPanel).update_host(latest_host)
 
     def _update_graph(self) -> None:
-        graph = self.query_one("#graph", ChartView)
+        try:
+            graph = self.query_one("#graph", ChartView)
+        except Exception:
+            return  # a timer fired while the screen is being torn down
 
         now = time.monotonic()
         window = self.timeframe_seconds
