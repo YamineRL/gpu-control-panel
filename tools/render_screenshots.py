@@ -127,6 +127,11 @@ def _host(now: float, count: int = 240, step: float = 0.5) -> list[HostSample]:
                 cores=8,
                 threads=16,
                 load1=6.4 + 9.0 * frac,
+                core_pcts=[
+                    max(0.0, min(100.0, cpu + 30.0 * math.sin(core * 1.7) + rng.uniform(-8, 8)))
+                    for core in range(16)
+                ],
+                ram_cache=int(7.4 * GIB),
                 ram_used=int((19.2 + 1.6 * frac) * GIB),
                 ram_total=int(32.0 * GIB),
                 swap_used=int(1.2 * GIB),

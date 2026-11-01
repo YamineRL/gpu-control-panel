@@ -48,6 +48,10 @@ HTTP_TIMEOUT = 1.0
 # How many finished requests the monitor remembers for the table. One row is
 # one request, so this caps scrollback, not screen space.
 HISTORY_RECORDS = 40
+# Requests kept since launch (the table and the session log both read it).
+ARCHIVE_RECORDS = 5000
+# How often the session log is rewritten while there is something new.
+LOG_SAVE_INTERVAL_S = 30.0
 # Re-run process/port discovery at most this often while nothing answers.
 REDISCOVER_S = 10.0
 # A couple of timeouts must pass before dropping a known-good target, so one
@@ -92,6 +96,8 @@ class RequestRecord:
     output_tokens: int = 0
     tok_s: float | None = None
     duration_s: float | None = None
+    # The model that served it. For a "swap" divider, the model swapped to.
+    model: str = ""
 
 
 @dataclass(slots=True)
@@ -531,6 +537,14 @@ class LlamaMonitor:
         self._history: deque[RequestRecord] = deque(maxlen=HISTORY_RECORDS)
         self._pending: RequestRecord | None = None
         self._pending_started = 0.0
+        # Every finished request since launch, newest first, with a "swap"
+        # divider each time the model changes. Survives target changes.
+        self._archive: deque[RequestRecord] = deque(maxlen=ARCHIVE_RECORDS)
+        self._archived_keys: set[tuple] = set()
+        self._archive_model = ""
+        self._log_path = _session_log_path()
+        self._log_dirty = False
+        self._next_save = time.monotonic() + LOG_SAVE_INTERVAL_S
         self.last_snapshot = InferenceSnapshot()
 
     # -- discovery -----------------------------------------------------
@@ -564,12 +578,14 @@ class LlamaMonitor:
                     candidate = replace(candidate, model=name)
             self._target = candidate
             self._model = candidate.model
+            self._note_model(candidate.model)
             self._prev = None
             self._live_gen = self._live_prefill = None
             self._last_gen = self._last_prefill = None
             self._requests = 0
             self._history.clear()
             self._pending = None
+            self._archived_keys.clear()
             self._failures = 0
             self._state = "offline"
             return candidate
@@ -579,7 +595,61 @@ class LlamaMonitor:
 
     def poll(self) -> InferenceSnapshot:
         with self._lock:
-            return self._poll_locked()
+            snapshot = self._poll_locked()
+            if time.monotonic() >= self._next_save:
+                self._save_log_locked()
+            return snapshot
+
+    def save_log(self) -> None:
+        """Write the session log now (the app calls this on quit)."""
+        with self._lock:
+            self._save_log_locked()
+
+    @property
+    def log_path(self) -> Path | None:
+        return self._log_path
+
+    # -- since-launch archive ------------------------------------------
+
+    def _note_model(self, model: str) -> None:
+        """Add a divider when a different model starts serving."""
+        if not model or model == self._archive_model:
+            return
+        if self._archive_model:
+            self._archive.appendleft(
+                RequestRecord(at=_wall_time(), status="swap", model=model)
+            )
+            self._log_dirty = True
+        self._archive_model = model
+
+    def _archive_record(self, record: RequestRecord) -> None:
+        key = (round(record.at, 1), record.prompt_tokens, record.output_tokens)
+        if key in self._archived_keys:
+            return
+        self._archived_keys.add(key)
+        if not record.model:
+            record = replace(record, model=self._model)
+        self._archive.appendleft(record)
+        self._log_dirty = True
+
+    def _with_archive(
+        self, running: RequestRecord | None
+    ) -> tuple[RequestRecord, ...]:
+        records = tuple(self._archive)
+        return (running, *records) if running is not None else records
+
+    def _save_log_locked(self) -> None:
+        self._next_save = time.monotonic() + LOG_SAVE_INTERVAL_S
+        if not self._log_dirty or self._log_path is None:
+            return
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._log_path.with_suffix(".tmp")
+            tmp.write_text(format_session_log(reversed(self._archive)))
+            tmp.replace(self._log_path)
+            self._log_dirty = False
+        except OSError:
+            pass  # a full or read-only disk must not break the dashboard
 
     def _offline(self, error: str, ctx_total: int = 0) -> InferenceSnapshot:
         self._state = "offline"
@@ -592,7 +662,7 @@ class LlamaMonitor:
             last_gen_tps=self._last_gen,
             last_prefill_tps=self._last_prefill,
             requests=self._requests,
-            history=tuple(self._history),
+            history=self._with_archive(None),
             ctx_total=ctx_total,
         )
         self.last_snapshot = snapshot
@@ -770,7 +840,7 @@ class LlamaMonitor:
             ctx_used=ctx_used,
             ctx_total=ctx_total,
             requests=self._requests,
-            history=tuple(self._history),
+            history=self._with_archive(None),
             new_session=new_session,
         )
         self.last_snapshot = snapshot
@@ -792,6 +862,7 @@ class LlamaMonitor:
         model = str(engine.get("model") or "")
         if model:
             self._model = model
+            self._note_model(model)
 
         raw = str(live.get("state") or "idle").lower()
         failure = engine.get("error")
@@ -881,7 +952,7 @@ class LlamaMonitor:
                 _as_int(engine.get("max_context")), _as_int(engine.get("context"))
             ),
             requests=self._requests,
-            history=_history_from_metrics(recent, state, live, prompt_tokens, generated),
+            history=self._strata_history(recent, state, live, prompt_tokens, generated),
             new_session=new_session,
         )
         self.last_snapshot = snapshot
@@ -925,8 +996,26 @@ class LlamaMonitor:
         if pending is None:
             return
         pending.status = "done" if pending.output_tokens else "cancelled"
+        pending.model = self._model
         self._history.appendleft(pending)
+        self._archive_record(pending)
         self._pending = None
+
+    def _strata_history(
+        self,
+        recent: list[dict],
+        state: str,
+        live: dict,
+        prompt_tokens: int,
+        output: int,
+    ) -> tuple[RequestRecord, ...]:
+        """Fold Strata's list into the archive; the running one goes on top."""
+        records = _history_from_metrics(recent, state, live, prompt_tokens, output)
+        running = records[0] if records and records[0].status == "running" else None
+        finished = records[1:] if running is not None else records
+        for record in reversed(finished):  # oldest first keeps the order
+            self._archive_record(record)
+        return self._with_archive(running)
 
 
 def _history_from_metrics(
@@ -969,6 +1058,31 @@ def _history_from_metrics(
             ),
         )
     return tuple(records)
+
+
+def _session_log_path() -> Path | None:
+    """One log per app launch, under the XDG state directory."""
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    return Path(base) / "gpuctl" / "requests" / f"{stamp}.log"
+
+
+def format_session_log(records) -> str:
+    """Plain text, oldest first, one line per request, a rule per swap."""
+    lines = ["# gpuctl request log: time state model prompt reused out tok/s dur"]
+    for record in records:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.at))
+        if record.status == "swap":
+            lines.append(f"---- {stamp} model swap -> {record.model} ----")
+            continue
+        rate = f"{record.tok_s:.1f}" if record.tok_s is not None else "-"
+        dur = f"{record.duration_s:.1f}s" if record.duration_s is not None else "-"
+        lines.append(
+            f"{stamp} {record.status:<9} {record.model or '-'} "
+            f"prompt={record.prompt_tokens} reused={record.reused_tokens} "
+            f"out={record.output_tokens} tok/s={rate} dur={dur}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def format_rate(value: float | None, *, compact: bool = False) -> str:

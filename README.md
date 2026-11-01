@@ -135,12 +135,13 @@ Under the tiles, `i` hides the whole grid for a fan-only view.
 
 ### Meters and requests
 
-The right column carries four one-line bars and the fan control:
+The right column carries two one-line bars and the fan control:
 
 - `CONTEXT`: the inference server's context use.
-- `SYSMEM`: used / total system RAM, from `/proc/meminfo`.
-- `SWAP`: used / total swap, marked `no swap` when the machine has none.
 - `FAN`: duty cycle and RPM.
+
+The CPU panel above the temperature graph shows the load of every CPU thread,
+RAM split into used, cache and free (from `/proc/meminfo`), and swap.
 
 `MODE` shows the fan's mode (`AUTO (firmware)`, `MANUAL`, `CURVE`, `FULL
 SPEED`), the current duty, the curve's target and a `HOT` marker when the

@@ -26,7 +26,7 @@ from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Button, Footer, Header, Static
 
-from .dashboard import Meters, RequestTable, StatusStrip, TileGrid
+from .dashboard import HostPanel, Meters, RequestTable, StatusStrip, TileGrid
 from .fancurve import FanCurveController, load_config, save_config
 from .gpu_processes import GpuProcessMonitor
 from .graphs import ChartView, Series, Threshold
@@ -323,6 +323,7 @@ class GpuCtlApp(App):
         yield TileGrid(id="tiles")
         with Horizontal(id="body"):
             with Vertical(id="graph-panel"):
+                yield HostPanel(id="host-panel")
                 with Horizontal(id="graph-toolbar"):
                     yield TimeframeBar(id="timeframe-bar")
                     yield ProbeRateBar(id="probe-rate-bar")
@@ -418,6 +419,8 @@ class GpuCtlApp(App):
         )
         table.update_records(self._snapshot.history)
         strip.update_status(self._snapshot, latest_host)
+        if latest_host is not None:
+            self.query_one(HostPanel).update_host(latest_host)
 
     def _update_graph(self) -> None:
         graph = self.query_one("#graph", ChartView)
@@ -575,10 +578,27 @@ class GpuCtlApp(App):
             self._update_graph()
         elif event.button.id and event.button.id.startswith("profile-"):
             self._select_profile(event.button.id.removeprefix("profile-"))
+        elif event.button.id == "open-log":
+            self._copy_log_dir()
         elif event.button.id == "probe-inc":
             self._adjust_probe_interval(PROBE_INTERVAL_STEP_MS)
         elif event.button.id == "probe-dec":
             self._adjust_probe_interval(-PROBE_INTERVAL_STEP_MS)
+
+    def _copy_log_dir(self) -> None:
+        """Copy the request-log folder to the clipboard (OSC 52, works over ssh)."""
+        path = self.inference.log_path
+        if path is None:
+            self.notify("no log folder", severity="warning")
+            return
+        self.inference.save_log()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        folder = str(path.parent)
+        self.copy_to_clipboard(folder)
+        self.notify(f"copied: {folder}", title="Request logs")
 
     @staticmethod
     def _load_last_timeframe() -> int:
@@ -902,6 +922,7 @@ class GpuCtlApp(App):
     async def action_quit(self) -> None:
         if self.fan_helper is not None:
             await self._stop_curve(None)
+        self.inference.save_log()
         self.exit()
 
 

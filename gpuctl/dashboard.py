@@ -6,8 +6,8 @@ three rows tall so it has room to show a shape, and a tile's scale comes from
 its own data (a 34 tok/s decode curve against a fixed 120 ceiling was a flat
 line at the bottom of the box).
 
-The meters are the bars the tile grid has no room for: context fill, system
-RAM, swap and the fan. The request table lists the newest requests first and
+The meters are the bars the tile grid has no room for: context fill
+and the fan. The request table lists the newest requests first and
 shows as many as the panel is tall.
 """
 
@@ -19,7 +19,7 @@ from collections.abc import Sequence
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Static
 
 from .fancurve import PROFILE_ORDER
@@ -595,11 +595,11 @@ class TileGrid(Vertical):
 
 
 class Meters(Vertical):
-    """The bars plus the fan control: context, RAM, swap, fan, profiles."""
+    """The bars plus the fan control: context, fan, profiles. RAM and swap live in HostPanel."""
 
     DEFAULT_CSS = """
     Meters {
-        height: 8;
+        height: 6;
         border: round $primary;
         padding: 0 1;
         margin-bottom: 1;
@@ -637,8 +637,6 @@ class Meters(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static(id="meter-context", markup=False)
-        yield Static(id="meter-ram", markup=False)
-        yield Static(id="meter-swap", markup=False)
         yield Static(id="meter-fan", markup=False)
         yield Static(id="fan-mode", markup=False)
         with Horizontal(id="fan-profiles"):
@@ -702,32 +700,6 @@ class Meters(Vertical):
             )
         )
 
-        ram_pct = host.ram_pct
-        ram_detail = (
-            f"{_fmt_gb((host.ram_used or 0) / GIB)}/{_fmt_gb((host.ram_total or 0) / GIB)} GB"
-            if host.ram_total
-            else "n/a"
-        )
-        self.query_one("#meter-ram", Static).update(
-            self._row(
-                "SYSMEM",
-                ram_pct,
-                ram_detail,
-                style="green" if (ram_pct or 0) < 80 else ("yellow" if (ram_pct or 0) < 92 else "red"),
-            )
-        )
-
-        swap_pct = host.swap_pct
-        if not host.swap_total:
-            swap_row = self._row("SWAP", None, "no swap")
-        else:
-            swap_row = self._row(
-                "SWAP",
-                swap_pct,
-                f"{_fmt_gb((host.swap_used or 0) / GIB)}/{_fmt_gb(host.swap_total / GIB)} GB",
-                style="green" if (swap_pct or 0) < 25 else ("yellow" if (swap_pct or 0) < 60 else "red"),
-            )
-        self.query_one("#meter-swap", Static).update(swap_row)
 
         rpm = f"{sample.fan_rpm} RPM" if sample.fan_rpm is not None else "no tach"
         self.query_one("#meter-fan", Static).update(
@@ -824,7 +796,7 @@ def _short_model(name: str) -> str:
 
 
 class RequestTable(Vertical):
-    """The newest requests, as many rows as the panel has lines for."""
+    """Every request since launch, newest on top; the body scrolls."""
 
     DEFAULT_CSS = """
     RequestTable {
@@ -833,9 +805,24 @@ class RequestTable(Vertical):
         border: round $primary;
         padding: 0 1;
     }
-    RequestTable Static {
-        height: 1fr;
+    RequestTable #req-head {
+        height: 1;
         width: 100%;
+    }
+    RequestTable #req-scroll {
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+    }
+    RequestTable #req-body {
+        width: 100%;
+        height: auto;
+    }
+    RequestTable #open-log {
+        height: 1;
+        min-width: 0;
+        width: auto;
+        border: none;
+        padding: 0 1;
     }
     """
 
@@ -855,36 +842,47 @@ class RequestTable(Vertical):
         self._records: tuple[RequestRecord, ...] = ()
 
     def compose(self) -> ComposeResult:
-        yield Static("waiting for a server", markup=False)
-
-    def on_resize(self) -> None:
-        self.refresh_table()
+        yield Static("", id="req-head", markup=False)
+        with VerticalScroll(id="req-scroll"):
+            yield Static("waiting for a server", id="req-body", markup=False)
+        yield Button("Open log (copy path)", id="open-log", compact=True)
 
     def update_records(self, records: Sequence[RequestRecord]) -> None:
+        old = self._records
         self._records = tuple(records)
+        # Rows arrive on top. A reader scrolled down keeps the same rows in
+        # view; one at the top keeps seeing the newest.
+        added = 0
+        if old and self._records:
+            try:
+                added = self._records.index(old[0]) if old[0].status != "running" else 0
+            except ValueError:
+                added = 0
         self.refresh_table()
+        scroll = self.query_one("#req-scroll", VerticalScroll)
+        if added and scroll.scroll_y > 0:
+            scroll.scroll_to(y=scroll.scroll_y + added, animate=False)
 
     def refresh_table(self) -> None:
-        """Fit the table to the panel; called again when the panel resizes."""
+        head = self.query_one("#req-head", Static)
+        body = self.query_one("#req-body", Static)
         if not self._records:
-            self.query_one(Static).update(
-                Text("no requests yet", style="grey62")
-            )
+            head.update("")
+            body.update(Text("no requests yet", style="grey62"))
             return
-        table = Text()
         header = Text()
         for index, (name, width, justify) in enumerate(self.COLUMNS):
             if index:
                 header.append(" ")
             header.append(f"{name:>{width}}" if justify == "right" else f"{name:<{width}}",
                           style="bold grey62")
-        table.append_text(header)
-
-        rows = max(1, self.size.height - 3)  # border, header, one spare
-        for record in self._records[:rows]:
-            table.append("\n")
+        head.update(header)
+        table = Text()
+        for index, record in enumerate(self._records):
+            if index:
+                table.append("\n")
             table.append_text(self._row(record))
-        self.query_one(Static).update(table)
+        body.update(table)
 
     # What the table calls a request's state. Long words would push the
     # columns apart in a 52-column panel.
@@ -898,6 +896,8 @@ class RequestTable(Vertical):
     }
 
     def _row(self, record: RequestRecord) -> Text:
+        if record.status == "swap":
+            return self._divider(record)
         stamp = (
             time.strftime("%H:%M:%S", time.localtime(record.at))
             if record.at > 0
@@ -927,3 +927,144 @@ class RequestTable(Vertical):
         )
         row.append(f"{duration:>6}", style="grey62")
         return row
+
+
+    def _divider(self, record: RequestRecord) -> Text:
+        """A rule across the table where the model was swapped."""
+        width = sum(w for _, w, _ in self.COLUMNS) + len(self.COLUMNS) - 1
+        stamp = time.strftime("%H:%M", time.localtime(record.at))
+        label = f" {stamp} swap -> {record.model} "
+        if len(label) > width - 4:
+            label = label[: width - 5] + "… "
+        left = 2
+        right = max(width - left - len(label), 0)
+        return Text("─" * left + label + "─" * right, style="bold dark_orange")
+
+
+RAM_USED = "#e070ff"
+RAM_CACHE = "#3d7bd9"
+SWAP_COLOR = "#f5c56b"
+
+
+def _load_style(pct: float | None) -> str:
+    if pct is None:
+        return "grey30"
+    if pct >= 85:
+        return "#ff4d5e"
+    if pct >= 50:
+        return "#f5c56b"
+    return "#34d399"
+
+
+class HostPanel(Static):
+    """Load per hardware thread, then RAM split into used / cache / free, then swap.
+
+    The thread grid reflows to the panel width: as many columns as fit at a
+    readable bar width, so 12 threads take 3 rows on a wide screen and 6 on a
+    narrow one. The panel height follows the row count.
+    """
+
+    DEFAULT_CSS = """
+    HostPanel {
+        height: auto;
+        border: round $primary;
+        padding: 0 1;
+    }
+    """
+
+    CELL_MIN = 22  # "11 ████████████  100%" plus a gap
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(markup=False, **kwargs)
+        self.border_title = "CPU · memory"
+        self._host = HostSample()
+
+    def update_host(self, host: HostSample) -> None:
+        self._host = host
+        self.border_title = self._title(host)
+        self.update(self._body(self.content_size.width or 80))
+
+    def on_resize(self) -> None:
+        self.update(self._body(self.content_size.width or 80))
+
+    @staticmethod
+    def _title(host: HostSample) -> str:
+        parts = ["CPU"]
+        if host.cpu_pct is not None:
+            parts.append(f"{host.cpu_pct:.0f}%")
+        if host.cores:
+            parts.append(f"{host.cores}c/{host.threads}t")
+        if host.load1 is not None:
+            parts.append(f"load {host.load1:.2f}")
+        return " · ".join(parts)
+
+    def _body(self, width: int) -> Text:
+        host = self._host
+        out = Text(no_wrap=True, overflow="crop")
+        cores = host.core_pcts or [None] * (host.threads or 0)
+        if cores:
+            columns = max(1, min(len(cores), width // self.CELL_MIN))
+            rows = math.ceil(len(cores) / columns)
+            cell = width // columns
+            bar_width = max(4, cell - 9)
+            for row in range(rows):
+                for col in range(columns):
+                    # Column-major, so cpu0..cpu5 read down the first column.
+                    index = col * rows + row
+                    if index >= len(cores):
+                        break
+                    pct = cores[index]
+                    style = _load_style(pct)
+                    out.append(f"{index:>2} ", style="grey50")
+                    out += _bar(pct, width=bar_width, style=style)
+                    label = f"{pct:4.0f}%" if pct is not None else "  -- "
+                    out.append(label, style="bold " + style if pct is not None else "grey30")
+                    out.append(" " * (cell - 3 - bar_width - 5))
+                out.append("\n")
+        out += self._ram_line(width)
+        out.append("\n")
+        out += self._swap_line(width)
+        return out
+
+    def _ram_line(self, width: int) -> Text:
+        host = self._host
+        line = Text()
+        line.append("RAM  ", style="grey62")
+        total = host.ram_total
+        if not total or host.ram_used is None:
+            line.append("n/a", style="grey30")
+            return line
+        used = host.ram_used
+        cache = min(host.ram_cache or 0, max(0, total - used))
+        free = max(0, total - used - cache)
+        legend = Text()
+        legend.append(f" used {_fmt_gb(used / GIB)}", style=RAM_USED)
+        legend.append(f"  cache {_fmt_gb(cache / GIB)}", style=RAM_CACHE)
+        legend.append(f"  free {_fmt_gb(free / GIB)}", style="grey62")
+        legend.append(f" / {_fmt_gb(total / GIB, 0)} GB", style="grey62")
+        bar_width = max(8, width - 5 - len(legend.plain))
+        used_cells = round(bar_width * used / total)
+        cache_cells = min(bar_width - used_cells, round(bar_width * cache / total))
+        line.append("█" * used_cells, style=RAM_USED)
+        line.append("█" * cache_cells, style=RAM_CACHE)
+        line.append("░" * (bar_width - used_cells - cache_cells), style="grey30")
+        line += legend
+        return line
+
+    def _swap_line(self, width: int) -> Text:
+        host = self._host
+        line = Text()
+        line.append("SWAP ", style="grey62")
+        if not host.swap_total:
+            line.append("no swap", style="grey30")
+            return line
+        used = host.swap_used or 0
+        legend = Text()
+        legend.append(
+            f" {_fmt_gb(used / GIB)} / {_fmt_gb(host.swap_total / GIB)} GB",
+            style=SWAP_COLOR if used else "grey62",
+        )
+        bar_width = max(8, width - 5 - len(legend.plain))
+        line += _bar(host.swap_pct, width=bar_width, style=SWAP_COLOR)
+        line += legend
+        return line

@@ -27,6 +27,7 @@ Screen {
 
 #graph {
     height: 1fr;
+    min-height: 8;
     border: round $primary;
     padding: 0 1;
 }

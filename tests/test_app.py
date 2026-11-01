@@ -9,6 +9,8 @@ the chart and inference-rate checks run anywhere.
 
 from __future__ import annotations
 
+import os
+
 import asyncio
 import shlex
 import tempfile
@@ -149,10 +151,18 @@ def test_host_readings() -> None:
         # /sys/block lists whole disks only; the partition line below must be
         # ignored even though /proc/diskstats reports it.
 
-        stat.write_text("cpu  100 0 100 800 0 0 0 0 0 0\n")
+        stat.write_text(
+            "cpu  100 0 100 800 0 0 0 0 0 0\n"
+            "cpu0 50 0 50 400 0 0 0 0 0 0\n"
+            "cpu1 50 0 50 400 0 0 0 0 0 0\n"
+        )
         meminfo.write_text(
             "MemTotal:       1000 kB\n"
             "MemAvailable:    250 kB\n"
+            "Cached:          300 kB\n"
+            "Buffers:          20 kB\n"
+            "SReclaimable:     30 kB\n"
+            "Shmem:            50 kB\n"
             "SwapTotal:       500 kB\n"
             "SwapFree:        300 kB\n"
         )
@@ -170,6 +180,9 @@ def test_host_readings() -> None:
         first = source.read(t=10.0)
         # No previous counters yet: a rate needs two reads.
         assert first.cpu_pct is None
+        assert first.core_pcts is None
+        # Cache counts what the kernel can drop: Shmem is excluded.
+        assert first.ram_cache == 300 * 1024
         assert first.disk_read_bps is None
         assert first.ram_used == 750 * 1024
         assert first.ram_total == 1000 * 1024
@@ -178,13 +191,19 @@ def test_host_readings() -> None:
 
         # Two seconds later: 100 busy jiffies of 1000 total, 6000 sectors read
         # (a partition's counters must not be added to its disk's).
-        stat.write_text("cpu  200 0 200 1600 0 0 0 0 0 0\n")
+        # cpu0 did all the extra work, cpu1 sat idle.
+        stat.write_text(
+            "cpu  200 0 200 1600 0 0 0 0 0 0\n"
+            "cpu0 150 0 150 400 0 0 0 0 0 0\n"
+            "cpu1 50 0 50 800 0 0 0 0 0 0\n"
+        )
         diskstats.write_text(
             "259       0 nvme0n1 10 0 6100 0 5 0 8040 0 0 0 0\n"
             "259       1 nvme0n1p1 9 0 6090 0 4 0 8030 0 0 0 0\n"
         )
         second = source.read(t=12.0)
         assert second.cpu_pct == 20.0, second.cpu_pct
+        assert second.core_pcts == [100.0, 0.0], second.core_pcts
         assert second.disk_read_bps == 1_536_000.0, second.disk_read_bps
         assert second.disk_write_bps == 2_048_000.0, second.disk_write_bps
 
@@ -244,7 +263,7 @@ def test_request_history() -> None:
 
 
 def test_request_table_fits_its_panel() -> None:
-    """More room under the meters means more request rows, never a spill."""
+    """All requests stay in the panel; the oldest is reached by scrolling."""
     from gpuctl.dashboard import RequestTable
     from gpuctl.llama import RequestRecord
     from textual.app import App
@@ -273,11 +292,15 @@ def test_request_table_fits_its_panel() -> None:
             table.update_records(records)
             await pilot.pause()
             await pilot.pause()
-            content = table.query_one(Static).render().plain
-            lines = content.splitlines()
-            # Border rows are not content; the panel is 12 tall.
-            assert len(lines) <= 12 - 2, len(lines)
-            assert len(lines) >= 5, len(lines)
+            from textual.containers import VerticalScroll
+
+            body = table.query_one("#req-body", Static).render().plain
+            # Every row is kept, oldest included, and the body scrolls to it.
+            assert len(body.splitlines()) == 40, len(body.splitlines())
+            assert "1,039" in body.splitlines()[-1]
+            scroll = table.query_one("#req-scroll", VerticalScroll)
+            assert scroll.max_scroll_y > 0
+            assert table.region.height <= 12
 
     asyncio.run(run())
 
@@ -673,6 +696,36 @@ def test_llama_swap_shell_wrapper() -> None:
         assert target is not None and target.api_key == "from-config", target
 
 
+def test_history_survives_model_swap() -> None:
+    """A swap keeps earlier requests, adds a divider, and lands in the log."""
+    import tempfile
+    from gpuctl import llama
+
+    def doc(model: str, at: float) -> dict:
+        return {
+            "engine": {"model": model},
+            "live": {"state": "idle"},
+            "requests": [{"time": at, "finish": "stop", "prompt_tokens": 100,
+                          "output_tokens": 20, "decode_tok_s": 21.0}],
+        }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["XDG_STATE_HOME"] = tmp
+        monitor = llama.LlamaMonitor()
+        monitor._target = llama.LlamaTarget(base_url="http://x", origin="x", engine="strata")
+        monitor._strata_snapshot(doc("model-a", 1000.0))
+        # The next model's Strata starts with an empty list of its own.
+        monitor._target = None
+        monitor._archived_keys.clear()
+        monitor._target = llama.LlamaTarget(base_url="http://x", origin="x", engine="strata")
+        snap = monitor._strata_snapshot(doc("model-b", 2000.0))
+        kinds = [(r.status, r.model) for r in snap.history]
+        assert kinds == [("stop", "model-b"), ("swap", "model-b"), ("stop", "model-a")], kinds
+        monitor.save_log()
+        text = monitor.log_path.read_text()
+        assert "model swap -> model-b" in text and "model-a" in text, text
+
+
 def test_strata_metrics_snapshot() -> None:
     """Strata's /metrics fills the same tiles from its own live rates."""
     from gpuctl import llama
@@ -882,5 +935,6 @@ if __name__ == "__main__":
     test_inference_rates()
     test_llama_swap_shell_wrapper()
     test_strata_metrics_snapshot()
+    test_history_survives_model_swap()
     test_app()
     print("all checks passed")

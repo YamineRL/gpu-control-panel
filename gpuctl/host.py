@@ -39,11 +39,16 @@ class HostSample:
     cores: int = 0
     threads: int = 0
     load1: float | None = None
+    # Busy percent per hardware thread, in kernel order (cpu0, cpu1, ...).
+    core_pcts: list[float | None] | None = None
 
     ram_used: int | None = None
     ram_total: int | None = None
     swap_used: int | None = None
     swap_total: int | None = None
+    # Page cache, buffers and reclaimable slab: memory the kernel gives back
+    # on demand. It is not part of ram_used (that is total - MemAvailable).
+    ram_cache: int | None = None
 
     disk_read_bps: float | None = None
     disk_write_bps: float | None = None
@@ -89,24 +94,45 @@ def _meminfo(path: str) -> dict[str, int]:
     return values
 
 
-def _cpu_totals(path: str) -> tuple[int, int] | None:
-    """Aggregate (busy, total) jiffies from the first /proc/stat line."""
+def _busy_total(parts: list[str]) -> tuple[int, int] | None:
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return None
+    total = sum(values)
+    idle = values[3] if len(values) > 3 else 0
+    iowait = values[4] if len(values) > 4 else 0
+    return total - idle - iowait, total
+
+
+def _cpu_counters(
+    path: str,
+) -> tuple[tuple[int, int] | None, dict[str, tuple[int, int]]]:
+    """(busy, total) jiffies for the aggregate line and for each cpuN line."""
     text = _read(path)
     if not text:
-        return None
+        return None, {}
+    aggregate = None
+    per_cpu: dict[str, tuple[int, int]] = {}
     for line in text.splitlines():
-        if not line.startswith("cpu "):
+        if not line.startswith("cpu"):
             continue
-        parts = line.split()[1:]
-        try:
-            values = [int(part) for part in parts]
-        except ValueError:
-            return None
-        total = sum(values)
-        idle = values[3] if len(values) > 3 else 0
-        iowait = values[4] if len(values) > 4 else 0
-        return total - idle - iowait, total
-    return None
+        label, *parts = line.split()
+        counters = _busy_total(parts)
+        if counters is None:
+            continue
+        if label == "cpu":
+            aggregate = counters
+        elif label[3:].isdigit():
+            per_cpu[label] = counters
+    return aggregate, per_cpu
+
+
+def _pct(now: tuple[int, int], before: tuple[int, int]) -> float | None:
+    total_delta = now[1] - before[1]
+    if total_delta <= 0:
+        return None
+    return max(0.0, min(100.0, (now[0] - before[0]) / total_delta * 100.0))
 
 
 def _disk_fields(path: str, names: set[str]) -> tuple[int, int] | None:
@@ -174,6 +200,7 @@ class HostSource:
         self.cores, self.threads = _cpu_shape(cpu_root)
         self._prev_cpu: tuple[float, int, int] | None = None
         self._prev_disk: tuple[float, int, int] | None = None
+        self._prev_cores: dict[str, tuple[int, int]] = {}
 
     def _disks(self) -> set[str]:
         try:
@@ -191,7 +218,17 @@ class HostSource:
         now = time.monotonic() if t is None else t
         sample = HostSample(t=now, cores=self.cores, threads=self.threads)
 
-        cpu = _cpu_totals(self.stat_path)
+        cpu, per_cpu = _cpu_counters(self.stat_path)
+        if per_cpu:
+            if self._prev_cores:
+                order = sorted(per_cpu, key=lambda name: int(name[3:]))
+                sample.core_pcts = [
+                    _pct(per_cpu[name], self._prev_cores[name])
+                    if name in self._prev_cores
+                    else None
+                    for name in order
+                ]
+            self._prev_cores = per_cpu
         if cpu is not None:
             if self._prev_cpu is not None:
                 prev_t, prev_busy, prev_total = self._prev_cpu
@@ -212,6 +249,14 @@ class HostSource:
             if total is not None and available is not None:
                 sample.ram_total = total
                 sample.ram_used = max(0, total - available)
+            cache_parts = [
+                memory.get(key) for key in ("Cached", "Buffers", "SReclaimable")
+            ]
+            if any(part is not None for part in cache_parts):
+                # Shmem sits inside Cached but cannot be dropped: leave it out.
+                cache = sum(part or 0 for part in cache_parts)
+                cache -= memory.get("Shmem", 0)
+                sample.ram_cache = max(0, cache)
             swap_total = memory.get("SwapTotal")
             swap_free = memory.get("SwapFree")
             if swap_total is not None and swap_free is not None:
