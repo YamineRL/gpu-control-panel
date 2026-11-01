@@ -6,6 +6,8 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.42] - 2026-11-01
+
 ### Changed
 
 - `run.sh` follows symlinks, so `ln -s $PWD/run.sh ~/.local/bin/gpuctl`
@@ -124,6 +126,7 @@ development line, with no state files to migrate.
 - `TempPanel`, `FanPanel` and `PowerPanel`, and their `ProgressBar` rules in
   `styles.tcss`.
 
-[Unreleased]: https://github.com/YamineRL/gpu-control-panel/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/YamineRL/gpu-control-panel/compare/v1.1.42...HEAD
+[1.1.42]: https://github.com/YamineRL/gpu-control-panel/compare/v1.1.0...v1.1.42
 [1.1.0]: https://github.com/YamineRL/gpu-control-panel/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/YamineRL/gpu-control-panel/releases/tag/v1.0.0
