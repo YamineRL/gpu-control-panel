@@ -6,18 +6,7 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- Graph bars no longer change value after they are drawn while the history
-  is shorter than the timeframe. The span grew on every tick, which
-  re-averaged every bar; it now grows in steps (15s, 30s, 1m, 2m, ...).
-
-### Changed
-
-- Recent requests speak plainly: STARTED, STATUS, CACHED, OUTPUT and TOTAL
-  replace TIME, STATE, REUSE, OUT and DUR. Statuses read active, done, limit,
-  cancel and failed (Strata's "stop" is a normal end, so it shows as done).
-  Durations read 12.3s, 8m39s or 52m. The session log uses the same words.
+## [1.1.42] - 2026-11-01
 
 ### Added
 
@@ -25,12 +14,9 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an opencode summary request as `compact`, so its time stands apart from
   the next request. gpuctl reads `GPUCTL_GATE_URL` (default
   `http://127.0.0.1:8082/gate/status`); set it to `off` without a gate.
-
 - **READ column**: how long each request spent reading its prompt, apart
   from the total. A long cache re-read (such as a compaction after a Strata
   reload) is now visible on its own.
-
-## [1.1.42] - 2026-11-01
 
 ### Changed
 
@@ -39,6 +25,10 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The big numbers in the Focus cards use the bold heavy-line digit font.
 - The speed range bar: a cat chasing a ball of wool marks the current tok/s
   instead of a dot; the track behind it carries the green-to-orange colour.
+- Recent requests speak plainly: STARTED, STATUS, CACHED, OUTPUT and TOTAL
+  replace TIME, STATE, REUSE, OUT and DUR. Statuses read active, done, limit,
+  cancel and failed (Strata's "stop" is a normal end, so it shows as done).
+  Durations read 12.3s, 8m39s or 52m. The session log uses the same words.
 
 ### Fixed
 
@@ -46,6 +36,9 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Recent requests: the TOK/S column shows the mean decode rate of each run
   (tokens over generate time), not the last smoothed reading. A running
   Strata row uses Strata's own mean.
+- Graph bars no longer change value after they are drawn while the history
+  is shorter than the timeframe. The span grew on every tick, which
+  re-averaged every bar; it now grows in steps (15s, 30s, 1m, 2m, ...).
 
 ## [1.1.0] - 2026-11-01
 
