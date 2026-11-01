@@ -8,6 +8,9 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `run.sh` follows symlinks, so `ln -s $PWD/run.sh ~/.local/bin/gpuctl`
+  gives a `gpuctl` command that works from any folder.
+
 - The big numbers in the Focus cards use the bold heavy-line digit font.
 - The speed range bar: a cat chasing a ball of wool marks the current tok/s
   instead of a dot; the track behind it carries the green-to-orange colour.

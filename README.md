@@ -88,6 +88,14 @@ python3 -m venv .venv
 .venv/bin/python main.py
 ```
 
+To launch it from anywhere with one command, link `run.sh` into a folder on
+your `PATH` (it follows the link back to the repo):
+
+```sh
+ln -s "$PWD/run.sh" ~/.local/bin/gpuctl
+gpuctl
+```
+
 Pass `--debug` to show the discovered hwmon path as a startup toast.
 
 ## Keys

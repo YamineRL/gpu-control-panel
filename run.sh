@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sets up the local venv (first run only) and launches GPU Control Panel.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+# Resolve symlinks, so a link in ~/.local/bin (`gpuctl`) still finds the repo.
+cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 VENV=.venv
 if [ ! -d "$VENV" ]; then
