@@ -6,6 +6,12 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Graph bars no longer change value after they are drawn while the history
+  is shorter than the timeframe. The span grew on every tick, which
+  re-averaged every bar; it now grows in steps (15s, 30s, 1m, 2m, ...).
+
 ### Changed
 
 - Recent requests speak plainly: STARTED, STATUS, CACHED, OUTPUT and TOTAL

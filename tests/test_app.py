@@ -736,12 +736,24 @@ def test_axes_chart_scrolls_without_boiling() -> None:
 
 
 def test_graph_span_fills_width() -> None:
-    """A young history is stretched over the whole width, not a sliver."""
-    assert _graph_span(1000.0, 300.0, None) == 300.0
-    assert _graph_span(1000.0, 300.0, 990.0) == 10.0
-    assert _graph_span(1000.0, 300.0, 100.0) == 300.0  # capped at timeframe
-    assert _graph_span(1000.0, 300.0, 1000.0) == 1.0  # never a zero-width axis
+    """A young history fills most of the width, and old bars hold still.
 
+    The span must not change on every probe tick: each change re-buckets
+    every bar, so bars already drawn change value (the bug: old spikes
+    read 83 then 75 on the next tick).
+    """
+    assert _graph_span(1000.0, 300.0, None) == 300.0
+    assert _graph_span(1000.0, 300.0, 100.0) == 300.0  # capped at timeframe
+    assert _graph_span(1000.0, 300.0, 1000.0) > 0.0  # never a zero-width axis
+    spans = []
+    for tick in range(3, 150):  # 2 s probes, history 6 s .. 298 s
+        age = tick * 2.0
+        span = _graph_span(1000.0 + age, 300.0, 1000.0)
+        assert span >= age, (age, span)  # all history is on screen
+        assert age < 15.0 or span <= 2.5 * age, (age, span)  # not a sliver
+        spans.append(span)
+    changes = sum(1 for x, y in zip(spans, spans[1:]) if x != y)
+    assert changes <= 6, changes
 
 def test_llama_swap_shell_wrapper() -> None:
     """A ``sh -c '... --port 8092'`` command must yield the real port.

@@ -87,17 +87,25 @@ CRIT_COLOR = "#ff4d5e"
 TIME_TICK_STEPS = (5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
 
 
-def _graph_span(now: float, window: float, oldest: float | None) -> float:
-    """Visible span: the selected timeframe, or all the history there is.
+# Spans a young history steps through, in seconds.
+SPAN_STEPS = (15, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 14400)
 
-    A five-minute window with ten seconds of samples is a nearly empty graph.
-    Spreading the young history across the full width keeps the body filling
-    the plot, and the span grows to the selected timeframe as samples build
-    up; after that it scrolls as usual.
+
+def _graph_span(now: float, window: float, oldest: float | None) -> float:
+    """Visible span: the selected timeframe, or the history there is.
+
+    A five-minute window with ten seconds of samples is a nearly empty graph,
+    so a young history is spread across the width. The span grows in steps
+    (15s, 30s, 1m, 2m, ...) and not on every tick: a span that changes every
+    tick changes every bar's time bucket, so old bars change value.
     """
     if oldest is None:
         return window
-    return min(window, max(now - oldest, 1.0))
+    age = now - oldest
+    for step in SPAN_STEPS:
+        if step >= age:
+            return min(window, float(step))
+    return window
 
 
 def _graph_range(
