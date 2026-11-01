@@ -17,10 +17,12 @@ import math
 import time
 from collections.abc import Sequence
 
+from rich.color import Color as RichColor
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Static
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.widget import Widget
+from textual.widgets import Button, Digits, Static
 
 from .fancurve import PROFILE_ORDER
 from .graphs import Series, Sparkline
@@ -51,6 +53,8 @@ CPU_LINE = "#f28b82"
 CPU_FILL = (56, 16, 14)
 DISK_LINE = "#c0cad4"
 DISK_FILL = (34, 40, 46)
+FAN_LINE = "#56c8e8"
+FAN_FILL = (0, 40, 52)
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -219,17 +223,234 @@ class Tile(Vertical):
         self.query_one(".tile-range", Static).update(Text(range_text))
 
 
+def _level_style(pct: float | None) -> str:
+    """Green, then yellow from 75 %, red from 90 %: for how full something is."""
+    if pct is None:
+        return "grey42"
+    if pct >= 90:
+        return "#ff5f5f"
+    if pct >= 75:
+        return "#ffd75f"
+    return "#87d75f"
+
+
+def _fill_bar(pct: float | None, width: int, style: str) -> Text:
+    """A full-width bar: filled cells, then a dim track."""
+    width = max(width, 1)
+    filled = 0 if pct is None else round(_clamp(pct) / 100 * width)
+    bar = Text()
+    bar.append("█" * filled, style=style)
+    bar.append("░" * (width - filled), style="grey30")
+    return bar
+
+
+def range_marker(
+    value: float | None, low: float | None, high: float | None, width: int
+) -> Text:
+    """`min 29.7 ├────●──┤ 37.0`: where the value sits between min and max.
+
+    The dot is green near max and orange near min, so a slowdown shows from
+    across the room.
+    """
+    line = Text()
+    if value is None or low is None or high is None:
+        line.append("min --  max --", style="grey50")
+        return line
+    left, right = f"min {low:.1f} ", f" {high:.1f} max"
+    track = max(width - len(left) - len(right) - 2, 3)
+    share = 1.0 if high <= low else (value - low) / (high - low)
+    share = min(max(share, 0.0), 1.0)
+    spot = round(share * (track - 1))
+    dot = "spring_green2" if share >= 0.66 else ("#ffd75f" if share >= 0.33 else "#ff9a3c")
+    line.append(left, style="grey62")
+    line.append("├", style="grey50")
+    line.append("─" * spot, style="grey50")
+    line.append("●", style="bold " + dot)
+    line.append("─" * (track - 1 - spot), style="grey50")
+    line.append("┤", style="grey50")
+    line.append(right, style="grey62")
+    return line
+
+
+class HeroCard(Vertical):
+    """A big number (3-row digits) with two lines of detail under it."""
+
+    DEFAULT_CSS = """
+    HeroCard {
+        width: 1fr;
+        min-width: 0;
+        height: 7;
+        border: round $primary;
+        padding: 0 1;
+        margin: 0 1 0 0;
+    }
+    HeroCard #hero-top { height: 3; width: 100%; }
+    HeroCard Digits { width: auto; margin-right: 1; }
+    HeroCard .hero-unit { width: auto; height: 3; content-align: left bottom; color: $text-muted; }
+    HeroCard Sparkline { width: 1fr; height: 3; margin-left: 1; }
+    HeroCard .hero-line { height: 1; width: 100%; text-overflow: ellipsis; }
+    """
+
+    def __init__(self, title: str, unit: str = "", spark: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.border_title = title
+        self._unit = unit
+        self._spark = spark
+        self._low: float | None = None
+        self._high: float | None = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="hero-top"):
+            yield Digits("--")
+            yield Static(self._unit, classes="hero-unit", markup=False)
+            if self._spark:
+                yield Sparkline()
+        yield Static("", classes="hero-line hero-a", markup=False)
+        yield Static("", classes="hero-line hero-b", markup=False)
+
+    # Session min/max: the same contract the tiles keep.
+    def reset_extremes(self) -> None:
+        self._low = None
+        self._high = None
+
+    @property
+    def extremes(self) -> tuple[float | None, float | None]:
+        return self._low, self._high
+
+    def note(self, values: Sequence[float | None]) -> None:
+        for item in values:
+            if item is None or not math.isfinite(item):
+                continue
+            self._low = item if self._low is None else min(self._low, item)
+            self._high = item if self._high is None else max(self._high, item)
+
+    def line_width(self) -> int:
+        return max(self.content_region.width, 10)
+
+    def paint_card(self, number: str, style: str, a: Text, b: Text) -> None:
+        digits = self.query_one(Digits)
+        digits.update(number)
+        # Textual CSS takes hex, not Rich's colour names.
+        digits.styles.color = RichColor.parse(style).get_truecolor().hex
+        self.query_one(".hero-a", Static).update(a)
+        self.query_one(".hero-b", Static).update(b)
+
+
+class HeroStrip(Horizontal):
+    """The three numbers that matter most, big: speed, context, prompt."""
+
+    DEFAULT_CSS = """
+    HeroStrip { height: 7; width: 100%; }
+    HeroStrip HeroCard#tile-speed { width: 4fr; }
+    HeroStrip HeroCard#hero-context { width: 4fr; }
+    HeroStrip HeroCard#hero-prompt { width: 3fr; margin-right: 0; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield HeroCard("SPEED", "tok/s", spark=True, id="tile-speed")
+        yield HeroCard("CONTEXT", "used", id="hero-context")
+        yield HeroCard("PROMPT", "", id="hero-prompt")
+
+    def update_hero(
+        self,
+        snapshot: InferenceSnapshot,
+        decode: list[tuple[float, float]],
+        session_started: float,
+        now: float,
+    ) -> None:
+        self._draw_speed(snapshot, decode, session_started, now)
+        self._draw_context(snapshot)
+        self._draw_prompt(snapshot)
+
+    def _draw_speed(self, snapshot, decode, session_started, now) -> None:
+        card = self.query_one("#tile-speed", HeroCard)
+        live, last = snapshot.gen_tps, snapshot.last_gen_tps
+        value = live if live is not None else last
+        card.note([y for at, y in decode if at >= session_started])
+        low, high = card.extremes
+        if snapshot.state == "generate" and live is not None:
+            style = "spring_green2"
+        elif value is not None:
+            style = "#5f875f"  # the last request's speed: dimmer than live
+        else:
+            style = "grey42"
+        if decode:
+            top = max(y for _, y in decode)
+            card.query_one(Sparkline).set_series(
+                [Series(decode, SPEED_LINE, SPEED_FILL)], now, SPARK_SPAN,
+                (0.0, max(top * 1.15, 1.0)),
+            )
+        a = range_marker(value, low, high, card.line_width())
+        b = Text()
+        if snapshot.state == "generate" and live is not None:
+            b.append("live", style="bold spring_green2")
+        elif value is not None:
+            b.append("last request", style="grey62")
+        else:
+            b.append("no request yet", style="grey50")
+        if snapshot.state == "generate" and snapshot.decoded_tokens:
+            b.append(f"   {snapshot.decoded_tokens:,} out", style="grey62")
+        card.paint_card(f"{value:.1f}" if value is not None else "--", style, a, b)
+
+    def _draw_context(self, snapshot) -> None:
+        card = self.query_one("#hero-context", HeroCard)
+        width = card.line_width()
+        if not snapshot.ctx_total:
+            card.paint_card("--", "grey42", _fill_bar(None, width, ""), Text("no server", style="grey50"))
+            return
+        pct = snapshot.ctx_used / snapshot.ctx_total * 100
+        style = _level_style(pct)
+        free = max(snapshot.ctx_total - snapshot.ctx_used, 0)
+        b = Text()
+        b.append(f"{format_tokens(snapshot.ctx_used)} / {format_tokens(snapshot.ctx_total)}", style="bold")
+        b.append(f"   {format_tokens(free)} free", style="grey62")
+        if snapshot.requests:
+            b.append(f"   {snapshot.requests} req", style="grey62")
+        card.paint_card(f"{pct:.0f}%", style, _fill_bar(pct, width, style), b)
+
+    def _draw_prompt(self, snapshot) -> None:
+        card = self.query_one("#hero-prompt", HeroCard)
+        width = card.line_width()
+        total = snapshot.prompt_total
+        rate = snapshot.prefill_tps if snapshot.prefill_tps is not None else snapshot.last_prefill_tps
+        if snapshot.state == "prefill" and total:
+            done = min(snapshot.prompt_processed + snapshot.prompt_cached, total)
+            pct = done / total * 100
+            b = Text()
+            b.append(f"{format_tokens(done)} / {format_tokens(total)}", style="bold " + PREFILL_COLOR)
+            if rate:
+                b.append(f"   {format_rate(rate)} tok/s", style="grey62")
+                left = (total - done) / rate
+                b.append(f"   ~{left:.0f}s left", style="grey62")
+            card.border_title = "PROMPT · reading"
+            card.paint_card(f"{pct:.0f}%", PREFILL_COLOR, _fill_bar(pct, width, PREFILL_COLOR), b)
+            return
+        card.border_title = "PROMPT · last"
+        if not total:
+            card.paint_card("--", "grey42", _fill_bar(None, width, ""), Text("no prompt yet", style="grey50"))
+            return
+        b = Text()
+        b.append("read at ", style="grey62")
+        b.append(f"{format_rate(rate)} tok/s", style="bold " + PREFILL_COLOR)
+        card.paint_card(format_tokens(total), "#5f87af", _fill_bar(100.0, width, "#2f4f6f"), b)
+
+
 class TileGrid(Vertical):
     """Two rows of four tiles: inference on top, hardware below."""
 
     DEFAULT_CSS = """
     TileGrid {
-        height: 16;
+        height: 23;
         width: 100%;
         padding: 0 1;
     }
-    TileGrid Horizontal {
-        height: 8;
+    TileGrid #tile-cells {
+        grid-size: 4 2;
+        grid-rows: 8;
+        height: 16;
+        width: 100%;
+    }
+    TileGrid #tile-cells Tile {
         width: 100%;
     }
     """
@@ -243,24 +464,29 @@ class TileGrid(Vertical):
         self._session_started = 0.0
 
     def compose(self) -> ComposeResult:
-        with Horizontal():
-            yield Tile("SPEED tok/s", id="tile-speed")
+        yield HeroStrip(id="hero", classes="layout-focus-only")
+        with Grid(id="tile-cells"):
+            # Layout 1 shows FAN here (speed is big, in the hero strip);
+            # layout 2 shows the classic SPEED tile instead.
+            yield Tile("FAN", id="tile-fan", classes="layout-focus-only")
+            yield Tile("SPEED tok/s", id="tile-speed-classic", classes="layout-classic-only")
             yield Tile("GPU TEMP", id="tile-temp")
             yield Tile("VRAM", id="tile-vram")
             yield Tile("POWER", id="tile-power")
-        with Horizontal():
             yield Tile("GPU LOAD", id="tile-busy")
             yield Tile("PCIe", id="tile-pcie")
             yield Tile("CPU", id="tile-cpu")
             yield Tile("DISK", id="tile-disk")
 
-    def tile(self, name: str) -> Tile:
-        return self.query_one(f"#tile-{name}", Tile)
+    def tile(self, name: str) -> Widget:
+        """A tile by name. "speed" is the big SPEED card in the hero strip."""
+        return self.query_one(f"#tile-{name}")
 
     def start_session(self, now: float) -> None:
         """Start a fresh decode/prefill min/max, keeping the sparkline."""
         self._session_started = now
         self.tile("speed").reset_extremes()
+        self.tile("speed-classic").reset_extremes()
 
     def push_inference(self, snapshot: InferenceSnapshot, now: float) -> None:
         """Keep the decode sparkline fed even when the screen is not redrawn."""
@@ -283,7 +509,11 @@ class TileGrid(Vertical):
     ) -> None:
         window = [s for s in samples if now - s.t <= SPARK_SPAN]
         host_window = [s for s in hosts if now - s.t <= SPARK_SPAN]
-        self._update_speed(now)
+        self.query_one(HeroStrip).update_hero(
+            self._snapshot, _series(self._decode), self._session_started, now
+        )
+        self._update_speed_classic(now)
+        self._update_fan(window, now)
         self._update_temp(window, limits, now)
         self._update_vram(window, now)
         self._update_power(window, limits, now)
@@ -292,7 +522,8 @@ class TileGrid(Vertical):
         self._update_cpu(host_window, now)
         self._update_disk(host_window, now)
 
-    def _update_speed(self, now: float) -> None:
+    def _update_speed_classic(self, now: float) -> None:
+        """Layout 2: speed as a regular tile."""
         snapshot = self._snapshot
         live, last = snapshot.gen_tps, snapshot.last_gen_tps
         decode = live if live is not None else last
@@ -326,7 +557,7 @@ class TileGrid(Vertical):
         else:
             y_range = (0.0, 1.0)
         session = [y for at, y in points if at >= self._session_started]
-        self.tile("speed").update_tile(
+        self.tile("speed-classic").update_tile(
             value=value,
             sub=sub,
             series=[Series(points, SPEED_LINE, SPEED_FILL)],
@@ -334,6 +565,30 @@ class TileGrid(Vertical):
             now=now,
             extremes=session,
             range_unit=" tok/s",
+        )
+
+    def _update_fan(self, window: Sequence[Sample], now: float) -> None:
+        latest = window[-1].fan_rpm if window else None
+        value = Text()
+        if latest is None:
+            value.append("--", style="dim")
+        else:
+            value.append(f"{latest:,}", style="bold " + FAN_LINE)
+            value.append(" RPM", style="dim")
+        pwm = window[-1].pwm if window else None
+        sub = Text(f"pwm {pwm / 255 * 100:.0f}%" if pwm is not None else "no pwm", style="grey62")
+        points = _series(_pick(window, "fan_rpm"))
+        values = [y for _, y in points]
+        top = max(values) if values else 1.0
+        self.tile("fan").update_tile(
+            value=value,
+            sub=sub,
+            series=[Series(points, FAN_LINE, FAN_FILL)],
+            y_range=(0.0, max(top * 1.15, 1.0)),
+            now=now,
+            extremes=values,
+            range_unit=" RPM",
+            range_digits=0,
         )
 
     def _temp_number(
@@ -599,7 +854,7 @@ class Meters(Vertical):
 
     DEFAULT_CSS = """
     Meters {
-        height: 6;
+        height: 5;
         border: round $primary;
         padding: 0 1;
         margin-bottom: 1;
@@ -636,7 +891,7 @@ class Meters(Vertical):
         self.border_title = "System"
 
     def compose(self) -> ComposeResult:
-        yield Static(id="meter-context", markup=False)
+        yield Static(id="meter-context", markup=False, classes="layout-classic-only")
         yield Static(id="meter-fan", markup=False)
         yield Static(id="fan-mode", markup=False)
         with Horizontal(id="fan-profiles"):
@@ -826,20 +1081,38 @@ class RequestTable(Vertical):
     }
     """
 
+    # key, header, width, justify. Dropped right to left of PRIORITY when the
+    # panel is narrow, so a row never wraps (a wrapped row breaks the table).
     COLUMNS = (
-        ("TIME", 8, "left"),
-        ("STATE", 6, "left"),
-        ("PROMPT", 6, "right"),
-        ("REUSE", 5, "right"),
-        ("OUT", 5, "right"),
-        ("TOK/S", 5, "right"),
-        ("DUR", 6, "right"),
+        ("time", "TIME", 8, "left"),
+        ("state", "STATE", 6, "left"),
+        ("prompt", "PROMPT", 6, "right"),
+        ("reuse", "REUSE", 5, "right"),
+        ("out", "OUT", 5, "right"),
+        ("rate", "TOK/S", 5, "right"),
+        ("dur", "DUR", 6, "right"),
     )
+    DROP_ORDER = ("reuse", "dur", "state", "prompt")
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.border_title = "Recent requests"
         self._records: tuple[RequestRecord, ...] = ()
+        self._columns = self.COLUMNS
+
+    def on_resize(self) -> None:
+        if self._records:
+            self.refresh_table()
+
+    def _fit_columns(self) -> tuple:
+        """The columns that fit one line, leaving room for the scrollbar."""
+        room = self.query_one("#req-head").size.width - 1
+        columns = list(self.COLUMNS)
+        for key in self.DROP_ORDER:
+            if sum(c[2] for c in columns) + len(columns) - 1 <= room:
+                break
+            columns = [c for c in columns if c[0] != key]
+        return tuple(columns)
 
     def compose(self) -> ComposeResult:
         yield Static("", id="req-head", markup=False)
@@ -870,8 +1143,9 @@ class RequestTable(Vertical):
             head.update("")
             body.update(Text("no requests yet", style="grey62"))
             return
+        self._columns = self._fit_columns()
         header = Text()
-        for index, (name, width, justify) in enumerate(self.COLUMNS):
+        for index, (_key, name, width, justify) in enumerate(self._columns):
             if index:
                 header.append(" ")
             header.append(f"{name:>{width}}" if justify == "right" else f"{name:<{width}}",
@@ -906,32 +1180,35 @@ class RequestTable(Vertical):
         label, style = self.STATE_LABELS.get(
             record.status, (record.status[:6], "grey74")
         )
-        row = Text()
-        row.append(f"{stamp:<8}", style="grey62")
-        row.append(" ")
-        row.append(f"{label:<6}", style=style)
-        row.append(" ")
-        row.append(f"{format_tokens(record.prompt_tokens):>6}", style="")
-        row.append(" ")
-        row.append(
-            f"{format_tokens(record.reused_tokens):>5}" if record.reused_tokens else f"{'--':>5}",
-            style="grey62",
-        )
-        row.append(" ")
-        row.append(f"{format_tokens(record.output_tokens):>5}")
-        row.append(" ")
-        row.append(f"{format_rate(record.tok_s):>5}", style="grey62")
-        row.append(" ")
         duration = (
             f"{record.duration_s:,.1f}s" if record.duration_s is not None else "--"
         )
-        row.append(f"{duration:>6}", style="grey62")
+        cells = {
+            "time": (f"{stamp:<8}", "grey62"),
+            "state": (f"{label:<6}", style),
+            "prompt": (f"{format_tokens(record.prompt_tokens):>6}", ""),
+            "reuse": (
+                f"{format_tokens(record.reused_tokens):>5}"
+                if record.reused_tokens
+                else f"{'--':>5}",
+                "grey62",
+            ),
+            "out": (f"{format_tokens(record.output_tokens):>5}", ""),
+            "rate": (f"{format_rate(record.tok_s):>5}", "grey62"),
+            "dur": (f"{duration:>6}", "grey62"),
+        }
+        row = Text()
+        for index, column in enumerate(self._columns):
+            if index:
+                row.append(" ")
+            text, cell_style = cells[column[0]]
+            row.append(text, style=cell_style)
         return row
 
 
     def _divider(self, record: RequestRecord) -> Text:
         """A rule across the table where the model was swapped."""
-        width = sum(w for _, w, _ in self.COLUMNS) + len(self.COLUMNS) - 1
+        width = sum(c[2] for c in self._columns) + len(self._columns) - 1
         stamp = time.strftime("%H:%M", time.localtime(record.at))
         label = f" {stamp} swap -> {record.model} "
         if len(label) > width - 4:

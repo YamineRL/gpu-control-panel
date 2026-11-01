@@ -17,6 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import gpuctl.app as app_module
 from gpuctl.app import GpuCtlApp, _graph_range, _graph_span, _time_ticks
 from gpuctl.dashboard import Meters
 from gpuctl.graphs import Series, render_chart, render_sparkline, snap_window
@@ -696,6 +697,40 @@ def test_llama_swap_shell_wrapper() -> None:
         assert target is not None and target.api_key == "from-config", target
 
 
+def test_request_rows_stay_on_one_line_at_any_width() -> None:
+    """A narrow panel drops columns instead of wrapping rows."""
+    from gpuctl.dashboard import RequestTable
+    from gpuctl.llama import RequestRecord
+    from textual.app import App
+    from textual.widgets import Static
+
+    table = RequestTable()
+
+    class Harness(App):
+        def compose(self):
+            yield table
+
+    record = RequestRecord(at=1_700_000_000.0, status="stop", prompt_tokens=99_000,
+                           reused_tokens=90_000, output_tokens=2_000,
+                           tok_s=24.0, duration_s=104.9)
+
+    async def run() -> None:
+        for width in (62, 46, 36):
+            async with Harness().run_test(size=(width, 12)) as pilot:
+                table.update_records((record,) * 5)
+                await pilot.pause()
+                await pilot.pause()
+                room = table.query_one("#req-head").size.width - 1
+                for line in table.query_one("#req-body", Static).render().plain.splitlines():
+                    assert len(line) <= room, (width, len(line), room)
+                if width >= 62:
+                    assert len(table._columns) == 7
+                else:
+                    assert len(table._columns) < 7
+
+    asyncio.run(run())
+
+
 def test_history_survives_model_swap() -> None:
     """A swap keeps earlier requests, adds a divider, and lands in the log."""
     import tempfile
@@ -898,12 +933,38 @@ async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
         )
         await pilot.pause()
         speed = grid.tile("speed")
-        value = speed.query_one(".tile-value").render().plain
-        assert "41.2" in value, value
-        sub = speed.query_one(".tile-sub").render().plain
-        assert "1,183" in sub, sub
-        context = app.query_one(Meters).query_one("#meter-context").render().plain
-        assert "3,200" in context, context
+        assert "41.2" in str(speed.query_one("Digits").value)
+        assert "live" in speed.query_one(".hero-a").render().plain + speed.query_one(".hero-b").render().plain
+        context = grid.query_one("#hero-context")
+        assert context.query_one("Digits").value == "3%", context.query_one("Digits").value
+        assert "3,200" in context.query_one(".hero-b").render().plain
+        prompt = grid.query_one("#hero-prompt").query_one(".hero-b").render().plain
+        assert "no prompt yet" in prompt, prompt  # the snapshot carries no prompt
+
+        # t switches to layout 2 (classic) and back; each shows its own cards.
+        saved = None
+        if app_module.LAYOUT_STATE_FILE.exists():
+            saved = app_module.LAYOUT_STATE_FILE.read_text()
+        try:
+            start = app.layout_name
+            assert start == "focus" or saved, start
+            hero = grid.query_one("#hero")
+            classic = grid.tile("speed-classic")
+            if start == "focus":
+                assert hero.display and not classic.display
+            await pilot.press("t")
+            await pilot.pause()
+            assert app.layout_name != start
+            assert hero.display == (app.layout_name == "focus")
+            assert classic.display == (app.layout_name == "classic")
+            await pilot.press("t")
+            await pilot.pause()
+            assert app.layout_name == start
+        finally:
+            if saved is None:
+                app_module.LAYOUT_STATE_FILE.unlink(missing_ok=True)
+            else:
+                app_module.LAYOUT_STATE_FILE.write_text(saved)
 
         # Pressing i hides the tiles again.
         await pilot.press("i")
@@ -913,6 +974,43 @@ async def _drive_app(app: GpuCtlApp, hwmon: HwmonSource) -> None:
 
 def test_app() -> None:
     asyncio.run(_app_checks())
+
+
+def test_gpu_process_counts_each_client_once() -> None:
+    """Two fds onto one DRM client must not double VRAM; GPU % is the busiest engine."""
+    import gpuctl.gpu_processes as gp
+
+    slot = "0000:03:00.0"
+    with tempfile.TemporaryDirectory() as root:
+        fdinfo = Path(root) / "4242" / "fdinfo"
+        fdinfo.mkdir(parents=True)
+
+        def write(gfx_ns: int, compute_ns: int) -> None:
+            body = (
+                f"drm-driver:\tamdgpu\ndrm-pdev:\t{slot}\ndrm-client-id:\t7\n"
+                "drm-memory-vram:\t1000 KiB\ndrm-memory-gtt:\t10 KiB\n"
+                f"drm-engine-gfx:\t{gfx_ns} ns\ndrm-engine-compute:\t{compute_ns} ns\n"
+                "drm-engine-capacity-gfx:\t1\n"
+            )
+            for fd in ("5", "9"):  # the same client seen through two fds
+                (fdinfo / fd).write_text(body)
+
+        clock = [100.0]
+        real = gp.time.monotonic
+        gp.time.monotonic = lambda: clock[0]
+        try:
+            monitor = gp.GpuProcessMonitor(proc_root=root)
+            write(0, 0)
+            (first,) = monitor.scan(slot)
+            assert first.vram_kib == 1000, first.vram_kib
+            assert first.gtt_kib == 10, first.gtt_kib
+            assert first.type_label == "Both G+C"
+            clock[0] = 101.0
+            write(600_000_000, 500_000_000)  # gfx 60 %, compute 50 % of 1 s
+            (second,) = monitor.scan(slot)
+        finally:
+            gp.time.monotonic = real
+        assert abs(second.gpu_pct - 60.0) < 0.01, second.gpu_pct
 
 
 if __name__ == "__main__":
@@ -935,6 +1033,8 @@ if __name__ == "__main__":
     test_inference_rates()
     test_llama_swap_shell_wrapper()
     test_strata_metrics_snapshot()
+    test_request_rows_stay_on_one_line_at_any_width()
     test_history_survives_model_swap()
+    test_gpu_process_counts_each_client_once()
     test_app()
     print("all checks passed")

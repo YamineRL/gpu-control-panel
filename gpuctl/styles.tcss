@@ -33,7 +33,7 @@ Screen {
 }
 
 #sidebar {
-    width: 52;
+    width: 58;
     min-width: 40;
     padding: 0 1 0 0;
 }
@@ -53,4 +53,110 @@ Screen {
 #control-hint {
     color: $text-muted;
     height: 1;
+}
+
+
+/* Narrow terminals (a phone over ssh): one column, the screen scrolls.
+   The app sets .narrow below 110 columns and .tiny below 70. */
+Screen.narrow {
+    overflow-y: auto;
+}
+
+Screen.narrow #body {
+    layout: vertical;
+    height: auto;
+}
+
+Screen.narrow #graph-panel {
+    width: 100%;
+    height: auto;
+    padding: 0;
+}
+
+Screen.narrow #graph {
+    height: 18;
+}
+
+Screen.narrow #sidebar {
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    padding: 0;
+}
+
+Screen.narrow Meters {
+    height: auto;
+}
+
+Screen.narrow RequestTable {
+    height: 18;
+}
+
+Screen.narrow TileGrid {
+    height: 53;
+}
+
+/* Phone: the three big cards stack, full width, at the very top. */
+Screen.narrow HeroStrip {
+    layout: vertical;
+    height: 21;
+}
+
+Screen.narrow HeroStrip HeroCard {
+    width: 100%;
+    margin: 0;
+}
+
+Screen.narrow TileGrid #tile-cells {
+    grid-size: 2 4;
+    height: 32;
+}
+
+Screen.narrow #graph-toolbar {
+    height: auto;
+    layout: vertical;
+}
+
+Screen.narrow #graph-toolbar ProbeRateBar {
+    width: 100%;
+}
+
+Screen.narrow #control-hint {
+    height: auto;
+}
+
+Screen.narrow #process-panel {
+    margin: 0 0 1 0;
+}
+
+Screen.tiny StatusStrip {
+    padding: 0 1;
+}
+
+Screen.tiny #graph {
+    height: 14;
+}
+
+/* Layouts (t cycles them). Layout 1 "focus" is the default: big speed,
+   context and prompt cards. Layout 2 "classic" is the 1.0 dashboard. A new
+   layout adds a name to LAYOUTS in app.py and its rules here. */
+Screen.layout-focus .layout-classic-only,
+Screen.layout-classic .layout-focus-only {
+    display: none;
+}
+
+Screen.layout-classic TileGrid {
+    height: 16;
+}
+
+Screen.layout-classic Meters {
+    height: 6;
+}
+
+Screen.narrow.layout-classic TileGrid {
+    height: 32;
+}
+
+Screen.narrow.layout-classic Meters {
+    height: auto;
 }

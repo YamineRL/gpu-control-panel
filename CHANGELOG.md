@@ -6,6 +6,45 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-01
+
+### Added
+
+- **Layouts, switched with `t`.** Layout 1 "Focus" is the new default; layout
+  2 "Classic" is the 1.0 dashboard. The choice is saved across restarts.
+  Layouts are a list in `app.py` plus their rules in `styles.tcss`, so new
+  ones are easy to add.
+- **Focus layout: three big cards on top.** SPEED shows decode tok/s in large
+  digits with a sparkline, and a `min ├──●──┤ max` bar that shows where the
+  current speed sits in this session's range (the dot is green near max,
+  orange near min). CONTEXT shows the fill in large digits with a full-width
+  bar (green, yellow from 75%, red from 90%) and the free tokens. PROMPT shows
+  reading progress live (percent, tokens read, rate, time left), or the last
+  prompt's size and read rate when idle.
+- **FAN tile** (Focus layout): RPM, pwm percent, sparkline and min/max.
+- **Request history since launch.** Recent requests keep every request of the
+  session, survive model swaps with a divider row naming the new model, and
+  scroll back to the first entry.
+- **Session logs** in `~/.local/state/gpuctl/requests/`, saved every 30 s and
+  on quit, and an "Open log" button that copies the folder path.
+- **Phone layout.** Below 110 columns everything stacks into one scrolling
+  column; below 70 columns the chart gets shorter. The request table drops
+  columns as the width shrinks, so each request stays on one line.
+
+### Changed
+
+- **The probe rate drives all data**: GPU sensors, CPU, RAM, disk and the
+  inference counters. Before, only the GPU sensors followed it. The fan curve
+  keeps its own 1 s timer so the fan always reacts quickly.
+- The sidebar is wider, so request rows fit beside the scrollbar.
+
+### Fixed
+
+- **Per-process GPU numbers.** A process with several fds onto one DRM client
+  had its VRAM counted once per fd; each client now counts once. GPU % now
+  uses the busiest engine instead of the sum of all engines, which reached
+  the 100% cap too early.
+
 ## [1.0.0] - 2026-10-25
 
 First tagged release. The dashboard is new; fan control, the temperature
@@ -76,5 +115,6 @@ development line, with no state files to migrate.
 - `TempPanel`, `FanPanel` and `PowerPanel`, and their `ProgressBar` rules in
   `styles.tcss`.
 
-[Unreleased]: https://github.com/YamineRL/gpu-control-panel/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/YamineRL/gpu-control-panel/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/YamineRL/gpu-control-panel/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/YamineRL/gpu-control-panel/releases/tag/v1.0.0

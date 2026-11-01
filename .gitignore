@@ -25,3 +25,4 @@ graft/
 .lact_tui_state
 .lact_tui_probe_interval
 .lact_tui_fancurve.json
+.gpuctl_layout

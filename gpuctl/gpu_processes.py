@@ -142,8 +142,10 @@ class GpuProcessMonitor:
     cumulative counters fdinfo/proc expose into instantaneous percentages.
     """
 
-    def __init__(self) -> None:
-        self._prev_engine_ns: dict[int, int] = {}
+    def __init__(self, proc_root: str = "/proc") -> None:
+        self._proc_root = proc_root
+        # pid -> engine name -> cumulative ns, summed over that pid's clients.
+        self._prev_engine_ns: dict[int, dict[str, int]] = {}
         self._prev_cpu_ticks: dict[int, int] = {}
         self._prev_t: float | None = None
         try:
@@ -157,13 +159,16 @@ class GpuProcessMonitor:
 
         vram_kib: dict[int, int] = {}
         gtt_kib: dict[int, int] = {}
-        engine_ns: dict[int, int] = {}
+        engine_ns: dict[int, dict[str, int]] = {}
         has_gfx: dict[int, bool] = {}
         has_compute: dict[int, bool] = {}
+        # Every fd onto the same DRM client (dup(), fork) repeats that client's
+        # numbers. Count each (pid, drm-client-id) once, or VRAM doubles.
+        seen_clients: set[tuple[int, str]] = set()
 
-        for fdinfo_dir in glob.glob("/proc/[0-9]*/fdinfo"):
+        for fdinfo_dir in glob.glob(f"{self._proc_root}/[0-9]*/fdinfo"):
             try:
-                pid = int(fdinfo_dir.split("/")[2])
+                pid = int(fdinfo_dir.rstrip("/").split("/")[-2])
             except (IndexError, ValueError):
                 continue
             try:
@@ -187,6 +192,11 @@ class GpuProcessMonitor:
                     continue
                 if fields.get("drm-pdev") != pci_slot:
                     continue
+                client = fields.get("drm-client-id")
+                if client is not None:
+                    if (pid, client) in seen_clients:
+                        continue
+                    seen_clients.add((pid, client))
 
                 vram_kib[pid] = vram_kib.get(pid, 0) + _parse_size_kib(
                     fields.get("drm-memory-vram", "0")
@@ -195,19 +205,22 @@ class GpuProcessMonitor:
                     fields.get("drm-memory-gtt", "0")
                 )
 
-                pid_engine_ns = engine_ns.get(pid, 0)
+                engines = engine_ns.setdefault(pid, {})
                 for key, value in fields.items():
-                    if not key.startswith("drm-engine-"):
+                    if not key.startswith("drm-engine-") or key.startswith(
+                        "drm-engine-capacity-"
+                    ):
                         continue
                     try:
-                        pid_engine_ns += int(value.split()[0])
+                        ns = int(value.split()[0])
                     except (ValueError, IndexError):
                         continue
-                    if key == "drm-engine-gfx":
+                    name = key[len("drm-engine-"):]
+                    engines[name] = engines.get(name, 0) + ns
+                    if name == "gfx":
                         has_gfx[pid] = True
-                    elif key == "drm-engine-compute":
+                    elif name == "compute":
                         has_compute[pid] = True
-                engine_ns[pid] = pid_engine_ns
 
         seen_pids = set(vram_kib) | set(gtt_kib) | set(engine_ns)
         new_cpu_ticks: dict[int, int] = {}
@@ -219,7 +232,13 @@ class GpuProcessMonitor:
 
             gpu_pct = 0.0
             if dt is not None and pid in self._prev_engine_ns:
-                delta_ns = engine_ns.get(pid, 0) - self._prev_engine_ns[pid]
+                # Engines run side by side: the busiest one is the load.
+                # Adding gfx + compute + dma would pass 100% too early.
+                before = self._prev_engine_ns[pid]
+                delta_ns = max(
+                    (ns - before.get(name, ns) for name, ns in engine_ns.get(pid, {}).items()),
+                    default=0,
+                )
                 if delta_ns > 0:
                     gpu_pct = max(0.0, min(100.0, delta_ns / (dt * 1e9) * 100))
 

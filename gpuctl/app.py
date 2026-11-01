@@ -49,14 +49,11 @@ PROBE_INTERVAL_MIN_MS = 500
 PROBE_INTERVAL_MAX_MS = 10000
 PROBE_INTERVAL_STEP_MS = 500
 
-# How often the inference server is asked for its counters. This runs in a
-# worker thread, so it never competes with rendering or mouse events.
-INFERENCE_INTERVAL_S = 0.5
-
-# CPU, RAM, swap and disk come from /proc: three small files, read once a
-# second regardless of the GPU probe rate so the host graphs stay smooth.
-HOST_INTERVAL_S = 1.0
-HOST_HISTORY = 3600
+# The probe rate drives every data source: GPU sensors, host stats (CPU,
+# RAM, swap, disk) and the inference server's counters. The inference poll
+# runs in a worker thread, so it never competes with rendering.
+# Sized for the fastest probe rate over the longest "1h" window.
+HOST_HISTORY = int(3600 / (PROBE_INTERVAL_MIN_MS / 1000)) + 10
 
 # The fan curve runs on its own timer so it stays responsive whatever probe
 # rate the graph uses.
@@ -71,6 +68,11 @@ MAX_SAMPLES = int(TIMEFRAMES[-1][1] / (PROBE_INTERVAL_MIN_MS / 1000)) + 10
 
 STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_state"
 PROBE_STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_probe_interval"
+LAYOUT_STATE_FILE = Path(__file__).resolve().parent.parent / ".gpuctl_layout"
+
+# Screen layouts, cycled with `t`. The first is the default. Each name maps to
+# a `layout-<name>` class on the screen; styles.tcss holds the rules.
+LAYOUTS = (("focus", "1 Focus"), ("classic", "2 Classic"))
 
 # Truecolor so the gradient bodies blend the same in every terminal theme.
 TEMP_COLORS = {"edge": "#38d6f5", "junction": "#ff9a3c", "mem": "#e070ff"}
@@ -272,6 +274,7 @@ class GpuCtlApp(App):
         Binding("right_square_bracket", "timeframe_next", "Timeframe +"),
         Binding("v", "toggle_processes", "Processes"),
         Binding("i", "toggle_inference", "Tiles"),
+        Binding("t", "cycle_layout", "Layout"),
         Binding("0", "jump_pct(0)", "0%", show=False),
         Binding("1", "jump_pct(10)", "10%", show=False),
         Binding("2", "jump_pct(20)", "20%", show=False),
@@ -288,6 +291,7 @@ class GpuCtlApp(App):
     probe_interval_ms: reactive[int] = reactive(PROBE_INTERVAL_DEFAULT_MS)
     show_processes: reactive[bool] = reactive(False)
     show_inference: reactive[bool] = reactive(True)
+    layout_name: reactive[str] = reactive(LAYOUTS[0][0])
 
     def __init__(self, hwmon: HwmonSource, debug: bool = False) -> None:
         super().__init__()
@@ -298,6 +302,7 @@ class GpuCtlApp(App):
         self._poll_timer = None
         self.timeframe_seconds = self._load_last_timeframe()
         self.probe_interval_ms = self._load_probe_interval()
+        self.layout_name = self._load_layout()
         self.gpu_process_monitor = GpuProcessMonitor()
         self._scanning_processes = False
         self.inference = LlamaMonitor()
@@ -336,12 +341,22 @@ class GpuCtlApp(App):
             yield Static(
                 "c = fan curve on/off  |  p = curve profile  |  a = firmware auto  |  "
                 "0-9 / s = manual %  |  [ / ] = timeframe  |  v = processes  |  "
-                "i = tiles",
+                "i = tiles  |  t = layout",
                 id="control-hint",
             )
         yield Footer()
 
+    NARROW_BELOW = 110
+    TINY_BELOW = 70
+
+    def on_resize(self, event) -> None:
+        """Switch to the one-column phone layout on a narrow terminal."""
+        width = event.size.width
+        self.screen.set_class(width < self.NARROW_BELOW, "narrow")
+        self.screen.set_class(width < self.TINY_BELOW, "tiny")
+
     def on_mount(self) -> None:
+        self.watch_layout_name(self.layout_name)
         self.query_one(TimeframeBar).set_active(self.timeframe_seconds)
         self.query_one(ProbeRateBar).set_value(self.probe_interval_ms)
         self.query_one(ProcessPanel).display = self.show_processes
@@ -359,21 +374,20 @@ class GpuCtlApp(App):
             self.notify(f"hwmon: {self.hwmon.hwmon_dir}", timeout=5)
         self._poll_once()
         self._poll_host()
-        self._restart_poll_timer()
-        self._host_timer = self.set_interval(HOST_INTERVAL_S, self._poll_host)
         self._schedule_inference()
-        self._inference_timer = self.set_interval(
-            INFERENCE_INTERVAL_S, self._schedule_inference
-        )
+        self._restart_poll_timer()
 
     # -------------------------------------------------------------- polling
 
     def _restart_poll_timer(self) -> None:
-        if self._poll_timer is not None:
-            self._poll_timer.stop()
-        self._poll_timer = self.set_interval(
-            self.probe_interval_ms / 1000, self._poll_once
-        )
+        """(Re)start the GPU, host and inference timers at the probe rate."""
+        for timer in (self._poll_timer, self._host_timer, self._inference_timer):
+            if timer is not None:
+                timer.stop()
+        interval = self.probe_interval_ms / 1000
+        self._poll_timer = self.set_interval(interval, self._poll_once)
+        self._host_timer = self.set_interval(interval, self._poll_host)
+        self._inference_timer = self.set_interval(interval, self._schedule_inference)
 
     def _poll_once(self) -> None:
         try:
@@ -649,6 +663,35 @@ class GpuCtlApp(App):
             PROBE_STATE_FILE.write_text(str(ms))
         except OSError:
             pass
+
+    # ---------------------------------------------------------------- layout
+
+    def watch_layout_name(self, name: str) -> None:
+        try:
+            screen = self.screen
+        except Exception:
+            return  # no screen yet: on_mount applies it
+        for other, _ in LAYOUTS:
+            screen.set_class(other == name, f"layout-{other}")
+
+    def action_cycle_layout(self) -> None:
+        names = [name for name, _ in LAYOUTS]
+        index = names.index(self.layout_name) if self.layout_name in names else -1
+        self.layout_name = names[(index + 1) % len(names)]
+        try:
+            LAYOUT_STATE_FILE.write_text(self.layout_name)
+        except OSError:
+            pass
+        label = dict(LAYOUTS)[self.layout_name]
+        self.notify(f"Layout {label}", timeout=2)
+
+    @staticmethod
+    def _load_layout() -> str:
+        try:
+            name = LAYOUT_STATE_FILE.read_text().strip()
+        except OSError:
+            return LAYOUTS[0][0]
+        return name if name in dict(LAYOUTS) else LAYOUTS[0][0]
 
     # -------------------------------------------------------------- processes
 
