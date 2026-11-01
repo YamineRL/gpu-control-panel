@@ -9,6 +9,8 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - The big numbers in the Focus cards use the bold heavy-line digit font.
+- The speed range bar: a cat chasing a ball of wool marks the current tok/s
+  instead of a dot; the track behind it carries the green-to-orange colour.
 
 ## [1.1.0] - 2026-11-01
 

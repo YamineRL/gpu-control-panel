@@ -17,6 +17,7 @@ import math
 import time
 from collections.abc import Sequence
 
+from rich.cells import cell_len
 from rich.color import Color as RichColor
 from rich.text import Text
 from textual.app import ComposeResult
@@ -247,26 +248,30 @@ def _fill_bar(pct: float | None, width: int, style: str) -> Text:
 def range_marker(
     value: float | None, low: float | None, high: float | None, width: int
 ) -> Text:
-    """`min 29.7 ├────●──┤ 37.0`: where the value sits between min and max.
+    """`min 29.7 ├━━━━━🐈🧶──┤ 37.0 max`: where the value sits between min and max.
 
-    The dot is green near max and orange near min, so a slowdown shows from
-    across the room.
+    A cat chases a ball of wool along the track; the ball marks the current
+    value. The track behind the cat is green near max and orange near min,
+    so a slowdown shows from across the room.
     """
     line = Text()
     if value is None or low is None or high is None:
         line.append("min --  max --", style="grey50")
         return line
     left, right = f"min {low:.1f} ", f" {high:.1f} max"
-    track = max(width - len(left) - len(right) - 2, 3)
+    marker = "🐈🧶"
+    marker_cells = cell_len(marker)
+    track = max(width - len(left) - len(right) - 2, marker_cells + 1)
     share = 1.0 if high <= low else (value - low) / (high - low)
     share = min(max(share, 0.0), 1.0)
-    spot = round(share * (track - 1))
-    dot = "spring_green2" if share >= 0.66 else ("#ffd75f" if share >= 0.33 else "#ff9a3c")
+    room = track - marker_cells
+    spot = round(share * room)
+    trail = "spring_green2" if share >= 0.66 else ("#ffd75f" if share >= 0.33 else "#ff9a3c")
     line.append(left, style="grey62")
     line.append("├", style="grey50")
-    line.append("─" * spot, style="grey50")
-    line.append("●", style="bold " + dot)
-    line.append("─" * (track - 1 - spot), style="grey50")
+    line.append("━" * spot, style=trail)
+    line.append(marker)
+    line.append("─" * (room - spot), style="grey50")
     line.append("┤", style="grey50")
     line.append(right, style="grey62")
     return line
